@@ -4,14 +4,16 @@ package main
 // アプリのルーター(chi / echo / gin など)とは別の http.Server で動くので、ルーティングには影響しない。
 // 外から叩かれないよう listen は localhost だけに絞っている。
 // import に別名を付けているのは、アプリ側の識別子(log など)と衝突させないため。
+//
+// 計測を終えたので止めている。プロファイルを取るときは、下のコメントを外す。
 
-import (
-	pprofhttp "net/http"
-	_ "net/http/pprof"
-)
-
-func init() {
-	go func() {
-		println("pprof:", pprofhttp.ListenAndServe("localhost:6060", nil).Error())
-	}()
-}
+// import (
+// 	pprofhttp "net/http"
+// 	_ "net/http/pprof"
+// )
+//
+// func init() {
+// 	go func() {
+// 		println("pprof:", pprofhttp.ListenAndServe("localhost:6060", nil).Error())
+// 	}()
+// }
