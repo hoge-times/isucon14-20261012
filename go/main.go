@@ -64,6 +64,7 @@ func main() {
 	}
 
 	go runChairLocationFlusher()
+	go runMatcher()
 
 	slog.Info("Listening on :8080")
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -186,6 +187,9 @@ func postInitialize(w http.ResponseWriter, r *http.Request) {
 	chairLocationFlushMu.Lock()
 	defer chairLocationFlushMu.Unlock()
 	chairLocationStates.discardPending()
+	// マッチングも初期化の間は止める
+	matchingMu.Lock()
+	defer matchingMu.Unlock()
 
 	if out, err := exec.Command("../sql/init.sh").CombinedOutput(); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to initialize: %s: %w", string(out), err))
