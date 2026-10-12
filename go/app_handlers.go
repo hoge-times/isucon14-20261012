@@ -741,57 +741,26 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 func getChairStats(ctx context.Context, tx executableQuery, chairID string) (appGetNotificationResponseChairStats, error) {
 	stats := appGetNotificationResponseChairStats{}
 
-	rides := []Ride{}
-	err := tx.SelectContext(
+	// 完了したライド(evaluation が入っている)の件数と評価の合計を1クエリで出す。
+	// 初期データには CARRYING を経ずに完了したライドがあり、元の実装はそれを数えないので EXISTS で揃える。
+	// 平均は MySQL の AVG(小数4桁に丸まる)を使わず、元と同じく Go で割る
+	row := struct {
+		TotalRidesCount int `db:"total_rides_count"`
+		TotalEvaluation int `db:"total_evaluation"`
+	}{}
+	if err := tx.GetContext(
 		ctx,
-		&rides,
-		`SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC`,
+		&row,
+		`SELECT COUNT(*) AS total_rides_count, IFNULL(SUM(r.evaluation), 0) AS total_evaluation FROM rides r
+WHERE r.chair_id = ? AND r.evaluation IS NOT NULL
+  AND EXISTS (SELECT 1 FROM ride_statuses rs WHERE rs.ride_id = r.id AND rs.status = 'CARRYING')`,
 		chairID,
-	)
-	if err != nil {
+	); err != nil {
 		return stats, err
 	}
-
-	totalRideCount := 0
-	totalEvaluation := 0.0
-	for _, ride := range rides {
-		rideStatuses := []RideStatus{}
-		err = tx.SelectContext(
-			ctx,
-			&rideStatuses,
-			`SELECT * FROM ride_statuses WHERE ride_id = ? ORDER BY created_at`,
-			ride.ID,
-		)
-		if err != nil {
-			return stats, err
-		}
-
-		var arrivedAt, pickupedAt *time.Time
-		var isCompleted bool
-		for _, status := range rideStatuses {
-			if status.Status == "ARRIVED" {
-				arrivedAt = &status.CreatedAt
-			} else if status.Status == "CARRYING" {
-				pickupedAt = &status.CreatedAt
-			}
-			if status.Status == "COMPLETED" {
-				isCompleted = true
-			}
-		}
-		if arrivedAt == nil || pickupedAt == nil {
-			continue
-		}
-		if !isCompleted {
-			continue
-		}
-
-		totalRideCount++
-		totalEvaluation += float64(*ride.Evaluation)
-	}
-
-	stats.TotalRidesCount = totalRideCount
-	if totalRideCount > 0 {
-		stats.TotalEvaluationAvg = totalEvaluation / float64(totalRideCount)
+	stats.TotalRidesCount = row.TotalRidesCount
+	if row.TotalRidesCount > 0 {
+		stats.TotalEvaluationAvg = float64(row.TotalEvaluation) / float64(row.TotalRidesCount)
 	}
 
 	return stats, nil
