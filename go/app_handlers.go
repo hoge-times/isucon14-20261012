@@ -818,11 +818,19 @@ func appGetNearbyChairs(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	chairs := []Chair{}
+	// 稼働中の椅子と最新の座標を1クエリで取る。最新の座標は coordinate が同じトランザクションで chair_distances に書いている。
+	// 座標が1件も無い椅子は chair_distances に行が無いので、元の実装と同じく対象外になる
+	chairs := []struct {
+		ID        string `db:"id"`
+		Name      string `db:"name"`
+		Model     string `db:"model"`
+		Latitude  int    `db:"latitude"`
+		Longitude int    `db:"longitude"`
+	}{}
 	err = tx.SelectContext(
 		ctx,
 		&chairs,
-		`SELECT * FROM chairs`,
+		`SELECT c.id, c.name, c.model, d.latitude, d.longitude FROM chairs c JOIN chair_distances d ON d.chair_id = c.id WHERE c.is_active = TRUE ORDER BY c.id`,
 	)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -842,39 +850,19 @@ func appGetNearbyChairs(w http.ResponseWriter, r *http.Request) {
 
 	nearbyChairs := []appGetNearbyChairsResponseChair{}
 	for _, chair := range chairs {
-		if !chair.IsActive {
-			continue
-		}
-
 		// 過去にライドが存在し、かつ、それが完了していない場合はスキップ
 		if busyChairs[chair.ID] {
 			continue
 		}
 
-		// 最新の位置情報を取得
-		chairLocation := &ChairLocation{}
-		err = tx.GetContext(
-			ctx,
-			chairLocation,
-			`SELECT * FROM chair_locations WHERE chair_id = ? ORDER BY created_at DESC LIMIT 1`,
-			chair.ID,
-		)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
-			}
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-
-		if calculateDistance(coordinate.Latitude, coordinate.Longitude, chairLocation.Latitude, chairLocation.Longitude) <= distance {
+		if calculateDistance(coordinate.Latitude, coordinate.Longitude, chair.Latitude, chair.Longitude) <= distance {
 			nearbyChairs = append(nearbyChairs, appGetNearbyChairsResponseChair{
 				ID:    chair.ID,
 				Name:  chair.Name,
 				Model: chair.Model,
 				CurrentCoordinate: Coordinate{
-					Latitude:  chairLocation.Latitude,
-					Longitude: chairLocation.Longitude,
+					Latitude:  chair.Latitude,
+					Longitude: chair.Longitude,
 				},
 			})
 		}
