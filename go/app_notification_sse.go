@@ -147,16 +147,9 @@ func writeAppNotifications(ctx context.Context, w http.ResponseWriter, rc *http.
 	return nil
 }
 
-// 通知の中身のうち、状態以外を組み立てる。
-// calculateDiscountedFare と getChairStats が *sqlx.Tx を受け取るので、読むためだけのトランザクションを張る
+// 通知の中身のうち、状態以外を組み立てる。読むだけなのでトランザクションは張らない
 func buildAppNotificationData(ctx context.Context, user *User, ride *Ride) (*appGetNotificationResponseData, error) {
-	tx, err := db.Beginx()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	fare, err := calculateDiscountedFare(ctx, tx, user.ID, ride, ride.PickupLatitude, ride.PickupLongitude, ride.DestinationLatitude, ride.DestinationLongitude)
+	fare, err := calculateDiscountedFare(ctx, db, user.ID, ride, ride.PickupLatitude, ride.PickupLongitude, ride.DestinationLatitude, ride.DestinationLongitude)
 	if err != nil {
 		return nil, err
 	}
@@ -178,11 +171,11 @@ func buildAppNotificationData(ctx context.Context, user *User, ride *Ride) (*app
 
 	if ride.ChairID.Valid {
 		chair := &Chair{}
-		if err := tx.GetContext(ctx, chair, `SELECT * FROM chairs WHERE id = ?`, ride.ChairID); err != nil {
+		if err := db.GetContext(ctx, chair, `SELECT * FROM chairs WHERE id = ?`, ride.ChairID); err != nil {
 			return nil, err
 		}
 
-		stats, err := getChairStats(ctx, tx, chair.ID)
+		stats, err := getChairStats(ctx, db, chair.ID)
 		if err != nil {
 			return nil, err
 		}
