@@ -203,7 +203,7 @@ func appGetRides(w http.ResponseWriter, r *http.Request) {
 	if err := tx.SelectContext(
 		ctx,
 		&rides,
-		`SELECT r.* FROM rides r WHERE r.user_id = ? AND `+latestRideStatusSubquery+` = 'COMPLETED' ORDER BY r.created_at DESC`,
+		`SELECT * FROM rides WHERE user_id = ? AND evaluation IS NOT NULL ORDER BY created_at DESC`,
 		user.ID,
 	); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -281,11 +281,6 @@ func getLatestRideStatus(ctx context.Context, tx executableGet, rideID string) (
 	}
 	return status, nil
 }
-
-// getLatestRideStatus と同じ条件で、rides の別名 r の最新状態を返す相関サブクエリ。
-// ライドのループの中で getLatestRideStatus を呼ぶ代わりに、一覧を取るクエリに埋め込んで1本にまとめる
-const latestRideStatusSubquery = `(SELECT rs.status FROM ride_statuses rs WHERE rs.ride_id = r.id ORDER BY rs.created_at DESC LIMIT 1)`
-
 func appPostRides(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	req := &appPostRidesRequest{}
@@ -309,7 +304,7 @@ func appPostRides(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback()
 
 	continuingRideCount := 0
-	if err := tx.GetContext(ctx, &continuingRideCount, `SELECT COUNT(*) FROM rides r WHERE r.user_id = ? AND `+latestRideStatusSubquery+` != 'COMPLETED'`, user.ID); err != nil {
+	if err := tx.GetContext(ctx, &continuingRideCount, `SELECT COUNT(*) FROM rides WHERE user_id = ? AND evaluation IS NULL`, user.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -529,6 +524,8 @@ func appPostRideEvaluatation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// evaluation は COMPLETED の INSERT と同じトランザクションで書く。
+	// app/rides と nearby-chairs は「evaluation が NULL なら未完了」として判定しているので、この2つを分けないこと
 	result, err := tx.ExecContext(
 		ctx,
 		`UPDATE rides SET evaluation = ? WHERE id = ?`,
@@ -869,9 +866,9 @@ func appGetNearbyChairs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 完了していないライドを持つ椅子を、椅子のループの前に1回でまとめて取る
+	// 完了していない(評価が付いていない)ライドを持つ椅子を、椅子のループの前に1回でまとめて取る
 	busyChairIDs := []string{}
-	if err := tx.SelectContext(ctx, &busyChairIDs, `SELECT DISTINCT r.chair_id FROM rides r WHERE r.chair_id IS NOT NULL AND `+latestRideStatusSubquery+` != 'COMPLETED'`); err != nil {
+	if err := tx.SelectContext(ctx, &busyChairIDs, `SELECT DISTINCT chair_id FROM rides WHERE chair_id IS NOT NULL AND evaluation IS NULL`); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
