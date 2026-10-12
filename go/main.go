@@ -4,13 +4,16 @@ import (
 	"context"
 	crand "crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -23,21 +26,52 @@ var db *sqlx.DB
 
 func main() {
 	mux := setup()
+	srv := &http.Server{Addr: ":8080", Handler: mux}
+
+	// systemd の停止(SIGQUIT)と OS の再起動(SIGTERM)で、座標の待ち行列を DB に書き切ってから終わる。
+	// Go は SIGQUIT を既定でゴルーチンダンプして落ちるので、ここで受ける
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		sig := <-sigCh
+		slog.Info("shutting down", "signal", sig.String())
+		// 新しい座標を受けないよう先に listen を閉じ、処理中のリクエストを少しだけ待つ
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		if err := srv.Shutdown(ctx); err != nil {
+			slog.Warn("failed to shutdown http server", "error", err)
+		}
+		cancel()
+		if err := flushChairLocationsOnShutdown(5 * time.Second); err != nil {
+			slog.Error("failed to flush chair locations on shutdown", "error", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}()
 
 	// DB は別の台にあり、再起動直後はまだ起きていないことがある。
-	// 空の map のまま応答を始めないよう、DB からライドの状態を作れるまで listen しない
+	// 空の map のまま応答を始めないよう、DB からライドの状態と椅子の座標を作れるまで listen しない
 	for {
 		// 再起動前に送った通知は DB に残っていないので、すべて送り済みとして作る
 		err := rideStates.rebuild(context.Background(), db, rebuildAllSent)
 		if err == nil {
+			err = chairLocationStates.rebuild(context.Background(), db)
+		}
+		if err == nil {
 			break
 		}
-		slog.Warn("failed to load ride states, retrying", "error", err)
+		slog.Warn("failed to load ride states or chair locations, retrying", "error", err)
 		time.Sleep(3 * time.Second)
 	}
 
+	go runChairLocationFlusher()
+
 	slog.Info("Listening on :8080")
-	http.ListenAndServe(":8080", mux)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		slog.Error("failed to listen", "error", err)
+		os.Exit(1)
+	}
+	// Shutdown で戻ってきたときは、シグナルを受けた goroutine が書き切って os.Exit するのを待つ
+	select {}
 }
 
 func setup() http.Handler {
@@ -148,6 +182,12 @@ func postInitialize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 座標のまとめ書きを止め(書いている最中なら終わるのを待つ)、初期化の間は再開させない。
+	// 待ち行列は初期化前のデータなので捨てる
+	chairLocationFlushMu.Lock()
+	defer chairLocationFlushMu.Unlock()
+	chairLocationStates.discardPending()
+
 	if out, err := exec.Command("../sql/init.sh").CombinedOutput(); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to initialize: %s: %w", string(out), err))
 		return
@@ -160,6 +200,11 @@ func postInitialize(w http.ResponseWriter, r *http.Request) {
 
 	// init.sh で入れ直したデータからライドの状態を作り直す。通知済みの印は初期データの *_sent_at をそのまま使う
 	if err := rideStates.rebuild(ctx, db, rebuildUseSentAt); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	// 座標のメモリも 4-chair-distances.sql で作った chair_distances から作り直す。戻るとまとめ書きが再開する
+	if err := chairLocationStates.rebuild(ctx, db); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

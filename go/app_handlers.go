@@ -812,24 +812,27 @@ func appGetNearbyChairs(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	// 稼働中の椅子と最新の座標を1クエリで取る。最新の座標は coordinate が同じトランザクションで chair_distances に書いている。
-	// 座標が1件も無い椅子は chair_distances に行が無いので、元の実装と同じく対象外になる
+	// 稼働中の椅子を取り、最新の座標はメモリから引く。
+	// 座標が1件も無い椅子はメモリに無いので、元の実装と同じく対象外になる
 	chairs := []struct {
-		ID        string `db:"id"`
-		Name      string `db:"name"`
-		Model     string `db:"model"`
-		Latitude  int    `db:"latitude"`
-		Longitude int    `db:"longitude"`
+		ID    string `db:"id"`
+		Name  string `db:"name"`
+		Model string `db:"model"`
 	}{}
 	err = tx.SelectContext(
 		ctx,
 		&chairs,
-		`SELECT c.id, c.name, c.model, d.latitude, d.longitude FROM chairs c JOIN chair_distances d ON d.chair_id = c.id WHERE c.is_active = TRUE ORDER BY c.id`,
+		`SELECT id, name, model FROM chairs WHERE is_active = TRUE ORDER BY id`,
 	)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	chairIDs := make([]string, len(chairs))
+	for i, c := range chairs {
+		chairIDs[i] = c.ID
+	}
+	positions := chairLocationStates.getMany(chairIDs)
 
 	// 完了していない(評価が付いていない)ライドを持つ椅子を、椅子のループの前に1回でまとめて取る
 	busyChairIDs := []string{}
@@ -848,15 +851,19 @@ func appGetNearbyChairs(w http.ResponseWriter, r *http.Request) {
 		if busyChairs[chair.ID] {
 			continue
 		}
+		pos, ok := positions[chair.ID]
+		if !ok {
+			continue
+		}
 
-		if calculateDistance(coordinate.Latitude, coordinate.Longitude, chair.Latitude, chair.Longitude) <= distance {
+		if calculateDistance(coordinate.Latitude, coordinate.Longitude, pos.Latitude, pos.Longitude) <= distance {
 			nearbyChairs = append(nearbyChairs, appGetNearbyChairsResponseChair{
 				ID:    chair.ID,
 				Name:  chair.Name,
 				Model: chair.Model,
 				CurrentCoordinate: Coordinate{
-					Latitude:  chair.Latitude,
-					Longitude: chair.Longitude,
+					Latitude:  pos.Latitude,
+					Longitude: pos.Longitude,
 				},
 			})
 		}

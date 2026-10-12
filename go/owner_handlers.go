@@ -1,7 +1,6 @@
 package main
 
 import (
-	"database/sql"
 	"errors"
 	"net/http"
 	"strconv"
@@ -163,19 +162,6 @@ func calculateSale(ride Ride) int {
 	return calculateFare(ride.PickupLatitude, ride.PickupLongitude, ride.DestinationLatitude, ride.DestinationLongitude)
 }
 
-type chairWithDetail struct {
-	ID                     string       `db:"id"`
-	OwnerID                string       `db:"owner_id"`
-	Name                   string       `db:"name"`
-	AccessToken            string       `db:"access_token"`
-	Model                  string       `db:"model"`
-	IsActive               bool         `db:"is_active"`
-	CreatedAt              time.Time    `db:"created_at"`
-	UpdatedAt              time.Time    `db:"updated_at"`
-	TotalDistance          int          `db:"total_distance"`
-	TotalDistanceUpdatedAt sql.NullTime `db:"total_distance_updated_at"`
-}
-
 type ownerGetChairResponse struct {
 	Chairs []ownerGetChairResponseChair `json:"chairs"`
 }
@@ -194,38 +180,30 @@ func ownerGetChairs(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	owner := ctx.Value("owner").(*Owner)
 
-	chairs := []chairWithDetail{}
-	// 座標が1件も無い椅子は chair_distances に行が無いので、0 と NULL(更新日時を返さない)になる
-	if err := db.SelectContext(ctx, &chairs, `SELECT chairs.id,
-       chairs.owner_id,
-       chairs.name,
-       chairs.access_token,
-       chairs.model,
-       chairs.is_active,
-       chairs.created_at,
-       chairs.updated_at,
-       IFNULL(chair_distances.total_distance, 0) AS total_distance,
-       chair_distances.total_distance_updated_at
-FROM chairs
-       LEFT JOIN chair_distances ON chair_distances.chair_id = chairs.id
-WHERE chairs.owner_id = ?
-`, owner.ID); err != nil {
+	chairs := []Chair{}
+	if err := db.SelectContext(ctx, &chairs, `SELECT * FROM chairs WHERE owner_id = ?`, owner.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	chairIDs := make([]string, len(chairs))
+	for i, c := range chairs {
+		chairIDs[i] = c.ID
+	}
+	// 総移動距離と更新日時はメモリから引く。座標が1件も無い椅子はメモリに無いので、0 と NULL(更新日時を返さない)になる
+	positions := chairLocationStates.getMany(chairIDs)
 
 	res := ownerGetChairResponse{}
 	for _, chair := range chairs {
 		c := ownerGetChairResponseChair{
-			ID:            chair.ID,
-			Name:          chair.Name,
-			Model:         chair.Model,
-			Active:        chair.IsActive,
-			RegisteredAt:  chair.CreatedAt.UnixMilli(),
-			TotalDistance: chair.TotalDistance,
+			ID:           chair.ID,
+			Name:         chair.Name,
+			Model:        chair.Model,
+			Active:       chair.IsActive,
+			RegisteredAt: chair.CreatedAt.UnixMilli(),
 		}
-		if chair.TotalDistanceUpdatedAt.Valid {
-			t := chair.TotalDistanceUpdatedAt.Time.UnixMilli()
+		if pos, ok := positions[chair.ID]; ok {
+			c.TotalDistance = pos.TotalDistance
+			t := pos.UpdatedAt.UnixMilli()
 			c.TotalDistanceUpdatedAt = &t
 		}
 		res.Chairs = append(res.Chairs, c)
