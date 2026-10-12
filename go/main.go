@@ -27,7 +27,8 @@ func main() {
 	// DB は別の台にあり、再起動直後はまだ起きていないことがある。
 	// 空の map のまま応答を始めないよう、DB からライドの状態を作れるまで listen しない
 	for {
-		err := rideStates.rebuild(context.Background(), db)
+		// 再起動前に送った通知は DB に残っていないので、すべて送り済みとして作る
+		err := rideStates.rebuild(context.Background(), db, rebuildAllSent)
 		if err == nil {
 			break
 		}
@@ -159,8 +160,8 @@ func postInitialize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// init.sh で入れ直したデータからライドの状態を作り直す
-	if err := rideStates.rebuild(ctx, db); err != nil {
+	// init.sh で入れ直したデータからライドの状態を作り直す。通知済みの印は初期データの *_sent_at をそのまま使う
+	if err := rideStates.rebuild(ctx, db, rebuildUseSentAt); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

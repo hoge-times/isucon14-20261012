@@ -207,11 +207,8 @@ func chairGetNotification(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	chair := ctx.Value("chair").(*Chair)
 
-	// 書き込みは chair_sent_at の UPDATE 1本だけなので、トランザクションを張らずに db へ直接撃つ
-	yetSentRideStatus := RideStatus{}
-	status := ""
-
-	// 椅子のいまのライドと、その最新の状態はメモリから引く
+	// DB は読むだけなので、トランザクションを張らずに db へ直接撃つ
+	// 椅子のいまのライド、その最新の状態、通知済みの印はメモリから引く
 	ride, ok := rideStates.getChairRide(chair.ID)
 	if !ok {
 		writeJSON(w, http.StatusOK, &chairGetNotificationResponse{
@@ -220,20 +217,15 @@ func chairGetNotification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := db.GetContext(ctx, &yetSentRideStatus, `SELECT * FROM ride_statuses WHERE ride_id = ? AND chair_sent_at IS NULL ORDER BY created_at ASC LIMIT 1`, ride.ID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			latest, ok := rideStates.getLatestStatus(ride.ID)
-			if !ok {
-				writeError(w, http.StatusInternalServerError, sql.ErrNoRows)
-				return
-			}
-			status = latest
-		} else {
-			writeError(w, http.StatusInternalServerError, err)
+	// 未通知の最古の状態は列の先頭をのぞくだけにし、送り済みにするのは応答を書く直前にする
+	status, pending := rideStates.peekChairPending(ride.ID)
+	if !pending {
+		latest, ok := rideStates.getLatestStatus(ride.ID)
+		if !ok {
+			writeError(w, http.StatusInternalServerError, sql.ErrNoRows)
 			return
 		}
-	} else {
-		status = yetSentRideStatus.Status
+		status = latest
 	}
 
 	user := &User{}
@@ -242,12 +234,9 @@ func chairGetNotification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if yetSentRideStatus.ID != "" {
-		_, err := db.ExecContext(ctx, `UPDATE ride_statuses SET chair_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSentRideStatus.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
+	// 読み取りが成功したので送り済みにする。途中で 500 を返した回は列を変えず、次の回に同じ状態を送る
+	if pending {
+		rideStates.markChairSent(ride.ID, status)
 	}
 
 	writeJSON(w, http.StatusOK, &chairGetNotificationResponse{
