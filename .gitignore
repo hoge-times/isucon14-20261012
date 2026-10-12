@@ -7,3 +7,7 @@ hoge.txt
 /go/isuride
 /mysql/debian.cnf
 /app-map-raw/
+# ローカル環境(docs/local.md)の公式リポジトリ・ビルド成果物・ログ
+/local/upstream/
+/local/build/
+/local/log/

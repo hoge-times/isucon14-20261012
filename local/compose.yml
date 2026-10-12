@@ -1,0 +1,101 @@
+# ISURIDE をローカル(Docker Desktop)で動かすための compose 定義。使い方は docs/local.md。
+#
+# 全サービスを net コンテナのネットワーク名前空間に入れ、i1 と同じく「1台のホスト」に見せる。
+# そのためリポジトリの nginx / MySQL 設定と env.sh を書き換えずにそのまま使える
+# (nginx -> localhost:8080、アプリ -> 127.0.0.1:3306、マッチャー -> https://isuride.xiv.isucon.net)。
+name: isuride-local
+
+services:
+  # ネットワーク名前空間の持ち主。公開ポートと /etc/hosts はここで定義する
+  net:
+    image: registry.k8s.io/pause:3.10
+    ports:
+      - "127.0.0.1:443:443"
+    extra_hosts:
+      # マッチャーが本番と同じ URL で nginx を叩けるようにする
+      - "isuride.xiv.isucon.net:127.0.0.1"
+      # ベンチマーカー(Mac 上)の決済サーバーにアプリから届くようにする
+      - "host.docker.internal:host-gateway"
+
+  db:
+    image: mysql:8.0
+    network_mode: service:net
+    environment:
+      MYSQL_ROOT_PASSWORD: isucon
+      # 初回起動時に initdb から呼ばれる sql/init.sh を何もせず終わらせる(公式の development と同じ)
+      ENV: local-dev
+    volumes:
+      - ../sql:/docker-entrypoint-initdb.d:ro
+      # 本番の /etc/mysql/mysql.conf.d に相当。イメージの /etc/my.cnf がこのディレクトリを読む
+      - ../mysql/mysql.conf.d:/etc/mysql/conf.d:ro
+      - mysql-data:/var/lib/mysql
+      - ./log/mysql:/var/log/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uisucon", "-pisucon", "--silent"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    image: isuride-local-app
+    network_mode: service:net
+    # PID 1 だと SIGTERM で止まらず停止に 10 秒待たされるので tini を挟む(matcher / payment_mock も同じ)
+    init: true
+    user: isucon
+    working_dir: /home/isucon/webapp/go
+    # バイナリは make build で local/build/ にクロスコンパイルしたものを使う
+    command: /home/isucon/webapp/local/build/isuride
+    env_file: env.sh
+    volumes:
+      - ..:/home/isucon/webapp:ro
+      - ./env.sh:/home/isucon/env.sh:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: on-failure
+
+  nginx:
+    image: nginx:1.24.0
+    network_mode: service:net
+    volumes:
+      # 本番の /etc/nginx と同じく、リポジトリの nginx/ をそのまま使う
+      - ../nginx:/etc/nginx:ro
+      - ../public:/home/isucon/webapp/public:ro
+      - ./log/nginx:/var/log/nginx
+    depends_on:
+      - app
+
+  # isuride-matcher.service と同じコマンド。自己署名証明書は CURL_CA_BUNDLE で信頼させる
+  matcher:
+    image: curlimages/curl:8.11.1
+    network_mode: service:net
+    init: true
+    env_file: env.sh
+    environment:
+      CURL_CA_BUNDLE: /etc/nginx/tls/_.xiv.isucon.net.crt
+    volumes:
+      - ../nginx/tls:/etc/nginx/tls:ro
+    command: ["/bin/sh", "-c", "while true; do curl -s https://isuride.xiv.isucon.net/api/internal/matching; sleep $$ISUCON_MATCHING_INTERVAL; done"]
+    depends_on:
+      - nginx
+    restart: on-failure
+
+  # isuride-payment_mock.service に相当(:12345)。ブラウザで触るとき用で、ベンチは自前の決済サーバーを使う
+  payment_mock:
+    image: isuride-local-app
+    network_mode: service:net
+    init: true
+    user: isucon
+    command: /home/isucon/webapp/local/build/payment_mock
+    volumes:
+      - ..:/home/isucon/webapp:ro
+    depends_on:
+      - app
+    restart: on-failure
+
+volumes:
+  mysql-data:
