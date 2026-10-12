@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -24,6 +25,10 @@ type appPostUsersResponse struct {
 	InvitationCode string `json:"invitation_code"`
 }
 
+// 招待コードつきの登録は、同時に走ると coupons の FOR UPDATE どうしでデッドロックする(#49 で 500 が 29 件)。
+// アプリは1プロセスなので、ここで1件ずつ通す。招待コードなしの登録は止めない
+var invitationMu sync.Mutex
+
 func appPostUsers(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	req := &appPostUsersRequest{}
@@ -39,6 +44,11 @@ func appPostUsers(w http.ResponseWriter, r *http.Request) {
 	userID := ulid.Make().String()
 	accessToken := secureRandomStr(32)
 	invitationCode := secureRandomStr(15)
+
+	if req.InvitationCode != nil && *req.InvitationCode != "" {
+		invitationMu.Lock()
+		defer invitationMu.Unlock()
+	}
 
 	tx, err := db.Beginx()
 	if err != nil {
