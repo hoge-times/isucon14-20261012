@@ -105,43 +105,10 @@ func chairPostCoordinate(w http.ResponseWriter, r *http.Request) {
 
 	chair := ctx.Value("chair").(*Chair)
 
-	tx, err := db.Beginx()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	defer tx.Rollback()
-
-	// 登録日時はアプリで決めて INSERT に渡し、読み直しをなくす。
+	// 座標はメモリに持ち、DB(chair_locations / chair_distances)へは runChairLocationFlusher がまとめて書く。
 	// created_at は DATETIME(6) なのでマイクロ秒に切り捨て、DB に入る値とレスポンスの値を揃える
 	chairLocationID := ulid.Make().String()
 	createdAt := time.Now().Truncate(time.Microsecond)
-	if _, err := tx.ExecContext(
-		ctx,
-		`INSERT INTO chair_locations (id, chair_id, latitude, longitude, created_at) VALUES (?, ?, ?, ?, ?)`,
-		chairLocationID, chair.ID, req.Latitude, req.Longitude, createdAt,
-	); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	// 前の座標との差分を総移動距離に足す。MySQL は代入を左から評価するので、total_distance を座標より先に書く。
-	// 既存の行の列は chair_distances. で修飾する(行エイリアス new と同名の列が曖昧になるため)。
-	// 更新日時は chair_locations に入れた created_at をそのまま入れ、元の集計の MAX(created_at) と揃える
-	if _, err := tx.ExecContext(
-		ctx,
-		`INSERT INTO chair_distances (chair_id, latitude, longitude, total_distance, total_distance_updated_at)
-VALUES (?, ?, ?, 0, ?) AS new
-ON DUPLICATE KEY UPDATE
-  total_distance = chair_distances.total_distance + ABS(new.latitude - chair_distances.latitude) + ABS(new.longitude - chair_distances.longitude),
-  latitude = new.latitude,
-  longitude = new.longitude,
-  total_distance_updated_at = new.total_distance_updated_at`,
-		chair.ID, req.Latitude, req.Longitude, createdAt,
-	); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
 
 	// 椅子のいまのライドと、その最新の状態はメモリから引く
 	rideID := ""
@@ -154,27 +121,24 @@ ON DUPLICATE KEY UPDATE
 		}
 		if status != "COMPLETED" && status != "CANCELED" {
 			if req.Latitude == ride.PickupLatitude && req.Longitude == ride.PickupLongitude && status == "ENROUTE" {
-				if _, err := tx.ExecContext(ctx, "INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)", ulid.Make().String(), ride.ID, "PICKUP"); err != nil {
-					writeError(w, http.StatusInternalServerError, err)
-					return
-				}
-				rideID, insertedStatus = ride.ID, "PICKUP"
+				insertedStatus = "PICKUP"
 			}
-
 			if req.Latitude == ride.DestinationLatitude && req.Longitude == ride.DestinationLongitude && status == "CARRYING" {
-				if _, err := tx.ExecContext(ctx, "INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)", ulid.Make().String(), ride.ID, "ARRIVED"); err != nil {
-					writeError(w, http.StatusInternalServerError, err)
-					return
-				}
-				rideID, insertedStatus = ride.ID, "ARRIVED"
+				insertedStatus = "ARRIVED"
 			}
+			rideID = ride.ID
+		}
+	}
+	// 状態の INSERT はトランザクションを張らず単独で撃つ。
+	// 失敗したら元と同じく座標も記録せずに 500 を返す
+	if insertedStatus != "" {
+		if _, err := db.ExecContext(ctx, "INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)", ulid.Make().String(), rideID, insertedStatus); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
+	chairLocationStates.record(chairLocationID, chair.ID, req.Latitude, req.Longitude, createdAt)
 	if insertedStatus != "" {
 		rideStates.setStatus(rideID, insertedStatus)
 	}
