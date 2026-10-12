@@ -2,14 +2,17 @@
 
 ISURIDE を Mac の Docker Desktop で動かし、手元のベンチマーカーで負荷走行するための手順。サーバー(i1〜i4)に触らずに、変更が pass するか、スコアが上がる方向かを先に確かめる用途。
 
-ファイルは `local/` にある(`compose.yml`、`Makefile`、`Dockerfile.app`、`env.sh`、`frontendhash/`)。コマンドはすべてリポジトリのルートから `make -C local <target>` で叩く。
+ファイルは `local/` にある(`compose.yml`、`Makefile`、`Dockerfile.app`、`env.sh`、`limits.sh`、`frontendhash/`)。コマンドはすべてリポジトリのルートから `make -C local <target>` で叩く。
 
 ## 構成
 
 全コンテナを `net` コンテナのネットワーク名前空間に入れて、i1 と同じ「1台のホスト」に見せている。そのためリポジトリの nginx / MySQL の設定と env.sh を**書き換えずにそのまま**使える(nginx → `localhost:8080`、アプリ → `127.0.0.1:3306`、マッチャー → `https://isuride.xiv.isucon.net/api/internal/matching`)。
 
+資源も i1 に寄せていて、全サービスで **2 vCPU / 4GiB を取り合う**(後述の「資源の上限」)。
+
 | サービス | 本番での相当 | 中身 |
 |---|---|---|
+| `limits` | (インスタンスタイプ) | 起動時に 1 回だけ動き、全サービスをまとめる親 cgroup に CPU とメモリの上限をかけて終了する |
 | `net` | (ホストそのもの) | ネットワーク名前空間の持ち主(pause コンテナ)。`127.0.0.1:443` だけを Mac に公開する。`/etc/hosts` に `isuride.xiv.isucon.net → 127.0.0.1` と `host.docker.internal` を入れている |
 | `db` | `mysql.service` | `mysql:8.0`。リポジトリの `mysql/mysql.conf.d/` を `/etc/mysql/conf.d` にマウント。データは volume `mysql-data`、ログは `local/log/mysql/` |
 | `app` | `isuride-go.service` | Ubuntu 24.04 + mysql クライアント。`make build` でクロスコンパイルした `local/build/isuride` を、作業ディレクトリ `/home/isucon/webapp/go` で動かす。リポジトリ全体を `/home/isucon/webapp` に読み取り専用でマウントしているので、`/api/initialize` から `../sql/init.sh` がそのまま動く |
@@ -65,8 +68,15 @@ make -C local bench
 ```
 
 - 結果は stdout の `結果 pass=true スコア=N` の行で見る。初期化 → 整合性チェック → 負荷 60 秒 → 最終チェックで、全体で 1 分強かかる。
-- 初回確認(2026-10-12、main の初期実装): **`pass=true スコア=7791`**、エラー 0 件。Apple M1(8 コア / 16GB)、Docker Desktop の VM は 8 CPU / 7.7GiB。
-- ローカルのスコアは本番と比べられない(マシンが違い、アプリ・DB・nginx・ベンチが同じ Mac で CPU を取り合う)。**pass するかの確認と、同じマシンでの変更前後の比較**に使う。
+- 初期実装(main)でのスコア(2026-10-12、Apple M1 8 コア / 16GB、Docker Desktop の VM は 8 CPU / 7.7GiB):
+
+  | 環境 | スコア |
+  |---|---|
+  | 本番(i4 → i1、c8i.large) | 2591 |
+  | ローカル、上限 2 vCPU / 4GiB(既定) | 4513、4285(後者は WARN 1 件: CODE=26 `total_distance` の反映遅れ) |
+  | ローカル、上限なし(8 CPU) | 7791 |
+
+- ローカルのスコアは上限をかけても本番より高い(残る差は後述)。**pass するかの確認と、同じマシンでの変更前後の比較**に使い、本番の点数の予想には使わない。同じ条件でも走行ごとにぶれる(上の 2 回で約 5% の差)ので、小さな差は複数回で見る。
 - 初回だけ、macOS のファイアウォールが `bench` の受信を許可するか聞いてくることがある。許可する(決済サーバーがアプリからの接続を受けるため)。
 
 ### 計測
@@ -83,6 +93,21 @@ make -C local bench
 127.0.0.1 isuride.xiv.isucon.net
 ```
 
+## 資源の上限
+
+i1(`c8i.large`)と同じく、全サービス合わせて **2 vCPU / 4GiB、スワップ無し** に制限している。
+
+- 仕組み: 全サービスを Docker Desktop の VM 上の親 cgroup `isuride-local` に入れ(`compose.yml` の `cgroup_parent`)、`limits` サービスがその親に `cpuset.cpus=0-1` と `memory.max=4G`、`memory.swap.max=0` を書く(`local/limits.sh`)。コンテナごとの上限ではなく、**1 台のマシンを全サービスで取り合う**形になる。`limits` は VM の cgroup を書くため privileged で動く。
+- ベンチは Mac 上で動くので上限の外にある(i4 が別マシンなのと同じ)。
+- 変える / 外す: `make -C local up CPUS=0-3 MEMORY=6G`、上限なしは `make -C local up CPUS=0-7 MEMORY=max`。`limits` が作り直されて、動いているコンテナにもその場で効く。何も付けずに `up` すると既定(2 vCPU / 4GiB)に戻る。
+- 確かめる: `docker compose -f local/compose.yml logs limits` に現在の値が出る。コンテナの中の `nproc` は 2 になる。`docker stats` の LIMIT はコンテナごとの値なので、親の上限は表示されない。
+- メモリを使い切ると、本番と同じく OOM でプロセスが落ちる。MySQL の `innodb_buffer_pool_size` などを大きくするときは、ローカルでも 4GiB に収まるか確かめられる。
+
+上限をかけても本番より点が高い。残っている差として考えられるのは次のとおり(どれが効いているかは未検証)。
+
+- CPU の 1 コアあたりの性能が違う(Apple M1 と c8i の Xeon)。VM の CPU 0〜1 には Docker Desktop 自体の処理も乗る。
+- ベンチの置き場所が違う。本番のベンチは i4(`c8i.large`、2 vCPU)で動き、VPC のネットワークを通る。ローカルは制限の無い Mac 上で動き、Docker Desktop のポート転送を通る。
+
 ## 静的ファイルの期待値を作り直す理由
 
 ベンチは `public/` の各ファイルの MD5 を、ビルド時に埋め込んだ `bench/benchrun/frontend_hashes.json`(とパスごとの読み込みファイル一覧 `frontend_files.json`)と照合する。AMI のビルドではフロントエンドをビルドし直した直後に、公式 `frontend/vite.config.ts` の `generateHashesFile` がこの 2 つを書き換え、その後でベンチをビルドしている。そのため i4 のベンチは i1 の `public/` と合っているが、公式リポジトリにコミットされている JSON とは合わない(そのままだと「/の内容が期待したものと一致しません」で即 fail する)。
@@ -93,7 +118,7 @@ make -C local bench
 
 | 項目 | ローカル | 本番(練習環境 i1 / i4) |
 |---|---|---|
-| マシン | Mac(Apple M1)の Docker Desktop VM。全サービスとベンチが同居 | i1 は `c8i.large`(本番の大会は `c5.large` 3 台)。ベンチは別機 i4 |
+| マシン | Mac(Apple M1)の Docker Desktop VM。全サービスで 2 vCPU / 4GiB(スワップ無し)を共有。ベンチは制限の無い Mac 上 | i1 は `c8i.large`(2 vCPU / 4GiB。本番の大会は `c5.large` 3 台)。ベンチは別機 i4(`c8i.large`) |
 | CPU アーキテクチャ | arm64(アプリも arm64 でビルド) | amd64 |
 | 台数 | 1 台相当のみ(i2 / i3 相当は無い) | 3 台 |
 | MySQL | `mysql:8.0` の公式イメージ(8.0.46、Oracle Linux ベース)。設定は `mysql/mysql.conf.d/` だけを読む(`conf.d/`・`my.cnf`・`debian.cnf` は使わない)。root のパスワードは `isucon` | Ubuntu 24.04 の apt の `mysql-server`(8.0 系。正確な版はサーバーで未確認)。root は `sudo mysql` |

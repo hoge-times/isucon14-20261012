@@ -3,12 +3,33 @@
 # 全サービスを net コンテナのネットワーク名前空間に入れ、i1 と同じく「1台のホスト」に見せる。
 # そのためリポジトリの nginx / MySQL 設定と env.sh を書き換えずにそのまま使える
 # (nginx -> localhost:8080、アプリ -> 127.0.0.1:3306、マッチャー -> https://isuride.xiv.isucon.net)。
+#
+# 資源も i1 に寄せる。全サービスを親 cgroup isuride-local に入れ、その親に CPU とメモリの上限をかけるので、
+# 全サービスで「2 vCPU / 4GiB の1台」を取り合う形になる(値は Makefile の CPUS / MEMORY)。
 name: isuride-local
 
 services:
+  # 親 cgroup を作って上限をかける1回きりのサービス。VM の cgroup を書くので privileged にしている
+  limits:
+    image: busybox:1.36
+    privileged: true
+    cgroup: host
+    environment:
+      CPUS: ${ISURIDE_CPUS:-0-1}
+      MEMORY: ${ISURIDE_MEMORY:-4G}
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup
+      - ./limits.sh:/limits.sh:ro
+    command: ["sh", "/limits.sh"]
+
   # ネットワーク名前空間の持ち主。公開ポートと /etc/hosts はここで定義する
+  # (ほかのサービスは network_mode でこれに依存するので、limits の後に起動する)
   net:
     image: registry.k8s.io/pause:3.10
+    cgroup_parent: isuride-local
+    depends_on:
+      limits:
+        condition: service_completed_successfully
     ports:
       - "127.0.0.1:443:443"
     extra_hosts:
@@ -20,6 +41,7 @@ services:
   db:
     image: mysql:8.0
     network_mode: service:net
+    cgroup_parent: isuride-local
     environment:
       MYSQL_ROOT_PASSWORD: isucon
       # 初回起動時に initdb から呼ばれる sql/init.sh を何もせず終わらせる(公式の development と同じ)
@@ -43,6 +65,7 @@ services:
       dockerfile: Dockerfile.app
     image: isuride-local-app
     network_mode: service:net
+    cgroup_parent: isuride-local
     # PID 1 だと SIGTERM で止まらず停止に 10 秒待たされるので tini を挟む(matcher / payment_mock も同じ)
     init: true
     user: isucon
@@ -61,6 +84,7 @@ services:
   nginx:
     image: nginx:1.24.0
     network_mode: service:net
+    cgroup_parent: isuride-local
     volumes:
       # 本番の /etc/nginx と同じく、リポジトリの nginx/ をそのまま使う
       - ../nginx:/etc/nginx:ro
@@ -73,6 +97,7 @@ services:
   matcher:
     image: curlimages/curl:8.11.1
     network_mode: service:net
+    cgroup_parent: isuride-local
     init: true
     env_file: env.sh
     environment:
@@ -88,6 +113,7 @@ services:
   payment_mock:
     image: isuride-local-app
     network_mode: service:net
+    cgroup_parent: isuride-local
     init: true
     user: isucon
     command: /home/isucon/webapp/local/build/payment_mock

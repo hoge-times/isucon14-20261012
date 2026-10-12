@@ -1,6 +1,11 @@
 # ローカル環境の操作。リポジトリのルートから make -C local <target> で使う。詳細は docs/local.md。
 
-compose = docker compose -f compose.yml
+# 全サービスで共有する資源の上限(i1 の c8i.large と同じ 2 vCPU / 4GiB)。
+# CPUS は Docker Desktop の VM の CPU 番号。上限を外すなら make -C local up CPUS=0-7 MEMORY=max
+CPUS ?= 0-1
+MEMORY ?= 4G
+
+compose = ISURIDE_CPUS=$(CPUS) ISURIDE_MEMORY=$(MEMORY) docker compose -f compose.yml
 # コンテナの CPU アーキテクチャ(Apple Silicon なら arm64)に合わせてクロスコンパイルする
 arch := $(shell docker version --format '{{.Server.Arch}}' 2>/dev/null || go env GOARCH)
 
