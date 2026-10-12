@@ -11,3 +11,4 @@ hoge.txt
 /local/upstream/
 /local/build/
 /local/log/
+/pprof/
