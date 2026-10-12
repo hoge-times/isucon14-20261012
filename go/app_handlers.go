@@ -613,6 +613,10 @@ func appPostRideEvaluatation(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// 通知のポーリング間隔(ms)。クライアントはこの時間だけ待ってから次の通知を取りに来る。
+// 仕様上は状態が変わってから3秒以内に通知できればよい。app と chair の両方の通知で使う
+const notificationRetryAfterMs = 300
+
 type appGetNotificationResponse struct {
 	Data         *appGetNotificationResponseData `json:"data"`
 	RetryAfterMs int                             `json:"retry_after_ms"`
@@ -656,7 +660,7 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 	if err := tx.GetContext(ctx, ride, `SELECT * FROM rides WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`, user.ID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeJSON(w, http.StatusOK, &appGetNotificationResponse{
-				RetryAfterMs: 30,
+				RetryAfterMs: notificationRetryAfterMs,
 			})
 			return
 		}
@@ -703,7 +707,7 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 			CreatedAt: ride.CreatedAt.UnixMilli(),
 			UpdateAt:  ride.UpdatedAt.UnixMilli(),
 		},
-		RetryAfterMs: 30,
+		RetryAfterMs: notificationRetryAfterMs,
 	}
 
 	if ride.ChairID.Valid {
