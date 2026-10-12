@@ -84,3 +84,5 @@ max_binlog_size   = 100M
 innodb_flush_log_at_trx_commit = 2
 # レプリケーションを使っていないので binlog は書かない
 disable_log_bin
+# 計測を終えたので、スロークエリログは取らない(Makefile の mrestart もオンにしない)
+slow_query_log = 0

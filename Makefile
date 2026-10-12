@@ -38,9 +38,11 @@ mrestart:
 	sudo mysqladmin flush-logs ${mysql_auth}
 	sudo systemctl restart mysql
 	sudo systemctl status mysql --no-pager
-	echo "set global slow_query_log = 1;" | sudo mysql ${mysql_auth}
-	echo "set global slow_query_log_file = '/var/log/mysql/slow.log';" | sudo mysql ${mysql_auth}
-	echo "set global long_query_time = 0;" | sudo mysql ${mysql_auth}
+	# 計測を終えたので、スロークエリログは取らない。pt-query-digest で見るときは下の 3 行に戻す
+	# echo "set global slow_query_log = 1;" | sudo mysql ${mysql_auth}
+	# echo "set global slow_query_log_file = '/var/log/mysql/slow.log';" | sudo mysql ${mysql_auth}
+	# echo "set global long_query_time = 0;" | sudo mysql ${mysql_auth}
+	echo "set global slow_query_log = 0;" | sudo mysql ${mysql_auth}
 
 # nginx のアクセスログを alp で集計
 .PHONY: nalp
