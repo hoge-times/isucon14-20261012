@@ -87,6 +87,7 @@ func chairPostActivity(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	authCaches.setChairActive(*chair, req.IsActive)
 
 	w.WriteHeader(http.StatusNoContent)
 }
