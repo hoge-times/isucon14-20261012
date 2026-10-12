@@ -1,0 +1,8 @@
+*.prof
+*.pb
+*.pb.gz
+/memo
+hoge.txt
+.DS_Store
+/go/isuride
+/mysql/debian.cnf
