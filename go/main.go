@@ -64,6 +64,9 @@ func setup() http.Handler {
 	if err != nil {
 		panic(err)
 	}
+	// MySQL の max_connections(151)を使い切らないよう上限を決め、張り直しを避けるためアイドルも同数残す
+	_db.SetMaxOpenConns(50)
+	_db.SetMaxIdleConns(50)
 	db = _db
 
 	mux := chi.NewRouter()
