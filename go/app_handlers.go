@@ -203,7 +203,7 @@ func appGetRides(w http.ResponseWriter, r *http.Request) {
 	if err := tx.SelectContext(
 		ctx,
 		&rides,
-		`SELECT * FROM rides WHERE user_id = ? ORDER BY created_at DESC`,
+		`SELECT r.* FROM rides r WHERE r.user_id = ? AND `+latestRideStatusSubquery+` = 'COMPLETED' ORDER BY r.created_at DESC`,
 		user.ID,
 	); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -212,15 +212,6 @@ func appGetRides(w http.ResponseWriter, r *http.Request) {
 
 	items := []getAppRidesResponseItem{}
 	for _, ride := range rides {
-		status, err := getLatestRideStatus(ctx, tx, ride.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		if status != "COMPLETED" {
-			continue
-		}
-
 		fare, err := calculateDiscountedFare(ctx, tx, user.ID, &ride, ride.PickupLatitude, ride.PickupLongitude, ride.DestinationLatitude, ride.DestinationLongitude)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -291,6 +282,10 @@ func getLatestRideStatus(ctx context.Context, tx executableGet, rideID string) (
 	return status, nil
 }
 
+// getLatestRideStatus と同じ条件で、rides の別名 r の最新状態を返す相関サブクエリ。
+// ライドのループの中で getLatestRideStatus を呼ぶ代わりに、一覧を取るクエリに埋め込んで1本にまとめる
+const latestRideStatusSubquery = `(SELECT rs.status FROM ride_statuses rs WHERE rs.ride_id = r.id ORDER BY rs.created_at DESC LIMIT 1)`
+
 func appPostRides(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	req := &appPostRidesRequest{}
@@ -313,22 +308,10 @@ func appPostRides(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	rides := []Ride{}
-	if err := tx.SelectContext(ctx, &rides, `SELECT * FROM rides WHERE user_id = ?`, user.ID); err != nil {
+	continuingRideCount := 0
+	if err := tx.GetContext(ctx, &continuingRideCount, `SELECT COUNT(*) FROM rides r WHERE r.user_id = ? AND `+latestRideStatusSubquery+` != 'COMPLETED'`, user.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
-	}
-
-	continuingRideCount := 0
-	for _, ride := range rides {
-		status, err := getLatestRideStatus(ctx, tx, ride.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		if status != "COMPLETED" {
-			continuingRideCount++
-		}
 	}
 
 	if continuingRideCount > 0 {
@@ -882,32 +865,25 @@ func appGetNearbyChairs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 完了していないライドを持つ椅子を、椅子のループの前に1回でまとめて取る
+	busyChairIDs := []string{}
+	if err := tx.SelectContext(ctx, &busyChairIDs, `SELECT DISTINCT r.chair_id FROM rides r WHERE r.chair_id IS NOT NULL AND `+latestRideStatusSubquery+` != 'COMPLETED'`); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	busyChairs := make(map[string]bool, len(busyChairIDs))
+	for _, id := range busyChairIDs {
+		busyChairs[id] = true
+	}
+
 	nearbyChairs := []appGetNearbyChairsResponseChair{}
 	for _, chair := range chairs {
 		if !chair.IsActive {
 			continue
 		}
 
-		rides := []*Ride{}
-		if err := tx.SelectContext(ctx, &rides, `SELECT * FROM rides WHERE chair_id = ? ORDER BY created_at DESC`, chair.ID); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-
-		skip := false
-		for _, ride := range rides {
-			// 過去にライドが存在し、かつ、それが完了していない場合はスキップ
-			status, err := getLatestRideStatus(ctx, tx, ride.ID)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, err)
-				return
-			}
-			if status != "COMPLETED" {
-				skip = true
-				break
-			}
-		}
-		if skip {
+		// 過去にライドが存在し、かつ、それが完了していない場合はスキップ
+		if busyChairs[chair.ID] {
 			continue
 		}
 
