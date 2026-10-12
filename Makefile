@@ -14,7 +14,8 @@ bench:
 re:
 	make arestart
 	make nrestart
-	make mrestart
+	# DB を別の台に分けたので、mysql を止めた台(アプリの台)では MySQL を起こさない
+	if systemctl is-enabled --quiet mysql; then make mrestart; else echo "この台では mysql が無効なので mrestart を飛ばします"; fi
 	echo "正常に make re が完了しました"
 
 .PHONY: arestart
