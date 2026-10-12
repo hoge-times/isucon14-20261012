@@ -656,8 +656,8 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	user := ctx.Value("user").(*User)
 
-	// 書き込みは app_sent_at の UPDATE 1本だけなので、トランザクションを張らずに db へ直接撃つ
-	// ユーザーの最新のライドと、その最新の状態はメモリから引く
+	// DB は読むだけなので、トランザクションを張らずに db へ直接撃つ
+	// ユーザーの最新のライド、その最新の状態、通知済みの印はメモリから引く
 	latestRide, ok := rideStates.getUserLatestRide(user.ID)
 	if !ok {
 		writeJSON(w, http.StatusOK, &appGetNotificationResponse{
@@ -667,22 +667,15 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 	}
 	ride := &latestRide
 
-	yetSentRideStatus := RideStatus{}
-	status := ""
-	if err := db.GetContext(ctx, &yetSentRideStatus, `SELECT * FROM ride_statuses WHERE ride_id = ? AND app_sent_at IS NULL ORDER BY created_at ASC LIMIT 1`, ride.ID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			latest, ok := rideStates.getLatestStatus(ride.ID)
-			if !ok {
-				writeError(w, http.StatusInternalServerError, sql.ErrNoRows)
-				return
-			}
-			status = latest
-		} else {
-			writeError(w, http.StatusInternalServerError, err)
+	// 未通知の最古の状態は列の先頭をのぞくだけにし、送り済みにするのは応答を書く直前にする
+	status, pending := rideStates.peekAppPending(ride.ID)
+	if !pending {
+		latest, ok := rideStates.getLatestStatus(ride.ID)
+		if !ok {
+			writeError(w, http.StatusInternalServerError, sql.ErrNoRows)
 			return
 		}
-	} else {
-		status = yetSentRideStatus.Status
+		status = latest
 	}
 
 	fare, err := calculateDiscountedFare(ctx, db, user.ID, ride, ride.PickupLatitude, ride.PickupLongitude, ride.DestinationLatitude, ride.DestinationLongitude)
@@ -731,12 +724,9 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if yetSentRideStatus.ID != "" {
-		_, err := db.ExecContext(ctx, `UPDATE ride_statuses SET app_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSentRideStatus.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
+	// 読み取りがすべて成功したので送り済みにする。途中で 500 を返した回は列を変えず、次の回に同じ状態を送る
+	if pending {
+		rideStates.markAppSent(ride.ID, status)
 	}
 
 	writeJSON(w, http.StatusOK, response)

@@ -28,7 +28,8 @@ func internalGetMatching(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 空き判定は元の実装と同じく「6つの状態をすべて椅子に通知済み」。椅子は前のライドが終わるまで次を受けないので、最新の1件だけを見る
+	// 空き判定は元の実装と同じく「6つの状態をすべて椅子に通知済み」。椅子は前のライドが終わるまで次を受けないので、最新の1件だけを見る。
+	// 通知済みの印はメモリにしか無いので、SQL では有効な椅子をすべて取り、Go 側で空きの椅子だけに絞る
 	// 最新の位置は ORDER BY に chair_id を含めると、インデックスの逆順読みで1行だけ引ける(含めないと filesort で全履歴を読む)
 	// 位置がまだ無い椅子も候補に残し、位置のある椅子が尽きたときだけ使う
 	chairs := []matchingChair{}
@@ -39,14 +40,17 @@ FROM chairs
   LEFT JOIN chair_locations ON chair_locations.id = (
     SELECT id FROM chair_locations WHERE chair_id = chairs.id ORDER BY chair_id DESC, created_at DESC LIMIT 1
   )
-WHERE chairs.is_active = TRUE
-  AND NOT EXISTS (
-    SELECT 1 FROM (SELECT id FROM rides WHERE chair_id = chairs.id ORDER BY updated_at DESC LIMIT 1) latest
-    WHERE (SELECT COUNT(chair_sent_at) FROM ride_statuses WHERE ride_statuses.ride_id = latest.id) < 6
-  )`); err != nil {
+WHERE chairs.is_active = TRUE`); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	free := chairs[:0]
+	for _, c := range chairs {
+		if rideStates.isChairFree(c.ID) {
+			free = append(free, c)
+		}
+	}
+	chairs = free
 
 	for _, ride := range rides {
 		if len(chairs) == 0 {

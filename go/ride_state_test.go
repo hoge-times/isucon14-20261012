@@ -145,7 +145,7 @@ func TestRideStateCacheLoad(t *testing.T) {
 		{RideID: "r2", Status: "ENROUTE", CreatedAt: at(15)},
 		{RideID: "r3", Status: "MATCHING", CreatedAt: at(5)},
 	}
-	c.load(rides, statuses)
+	c.load(rides, statuses, rebuildAllSent)
 
 	// 作り直す前の中身は残らない
 	if _, ok := c.getRide("old"); ok {
@@ -174,5 +174,241 @@ func TestRideStateCacheLoad(t *testing.T) {
 		if got, _ := c.getLatestStatus(rideID); got != want {
 			t.Errorf("getLatestStatus(%s) = %q; want %q", rideID, got, want)
 		}
+	}
+}
+
+func pendingOf(t *testing.T, c *rideStateCache, rideID string) (app, chair []string, chairSent int) {
+	t.Helper()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	n, ok := c.notify[rideID]
+	if !ok {
+		return nil, nil, 0
+	}
+	return append([]string{}, n.appPending...), append([]string{}, n.chairPending...), n.chairSent
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestRideStateCachePendingOrder(t *testing.T) {
+	c := newRideStateCache()
+	c.setStatus("r1", "MATCHING")
+	c.setStatus("r1", "ENROUTE")
+	// 同じ状態は二重に積まない
+	c.setStatus("r1", "ENROUTE")
+
+	want := []string{"MATCHING", "ENROUTE"}
+	app, chair, sent := pendingOf(t, c, "r1")
+	if !equalStrings(app, want) || !equalStrings(chair, want) || sent != 0 {
+		t.Fatalf("pending = %v, %v, %d; want %v, %v, 0", app, chair, sent, want, want)
+	}
+}
+
+func TestRideStateCachePendingOutOfOrder(t *testing.T) {
+	c := newRideStateCache()
+	c.setStatus("r1", "MATCHING")
+	c.setStatus("r1", "ENROUTE")
+	c.setStatus("r1", "CARRYING")
+	// 反映が前後して PICKUP が後から来ても、列の順番は崩れない
+	c.setStatus("r1", "PICKUP")
+
+	want := []string{"MATCHING", "ENROUTE", "PICKUP", "CARRYING"}
+	app, chair, _ := pendingOf(t, c, "r1")
+	if !equalStrings(app, want) || !equalStrings(chair, want) {
+		t.Fatalf("pending = %v, %v; want %v", app, chair, want)
+	}
+	// 最新状態は戻らないが、通知の列には入る
+	if s, _ := c.getLatestStatus("r1"); s != "CARRYING" {
+		t.Fatalf("getLatestStatus = %q; want CARRYING", s)
+	}
+
+	// 先頭が送り済みになった後に前の状態が来ても、列の先頭に入って捨てられない
+	c2 := newRideStateCache()
+	c2.setStatus("r2", "ENROUTE")
+	c2.markAppSent("r2", "ENROUTE")
+	c2.setStatus("r2", "MATCHING")
+	if s, ok := c2.peekAppPending("r2"); !ok || s != "MATCHING" {
+		t.Fatalf("peekAppPending = %q, %v; want MATCHING", s, ok)
+	}
+}
+
+func TestRideStateCachePeekAndMarkSent(t *testing.T) {
+	c := newRideStateCache()
+	if _, ok := c.peekAppPending("r1"); ok {
+		t.Fatal("peekAppPending: 無いライドの未送信が見つかった")
+	}
+	if _, ok := c.peekChairPending("r1"); ok {
+		t.Fatal("peekChairPending: 無いライドの未送信が見つかった")
+	}
+
+	c.setStatus("r1", "MATCHING")
+	c.setStatus("r1", "ENROUTE")
+
+	// のぞくだけでは取り除かない(途中で 500 を返した回は次の回に同じ状態を送る)
+	for i := 0; i < 2; i++ {
+		if s, ok := c.peekAppPending("r1"); !ok || s != "MATCHING" {
+			t.Fatalf("peekAppPending = %q, %v; want MATCHING", s, ok)
+		}
+		if s, ok := c.peekChairPending("r1"); !ok || s != "MATCHING" {
+			t.Fatalf("peekChairPending = %q, %v; want MATCHING", s, ok)
+		}
+	}
+
+	// app と椅子の列は別々に進む
+	c.markAppSent("r1", "MATCHING")
+	if s, _ := c.peekAppPending("r1"); s != "ENROUTE" {
+		t.Fatalf("peekAppPending = %q; want ENROUTE", s)
+	}
+	if s, _ := c.peekChairPending("r1"); s != "MATCHING" {
+		t.Fatalf("peekChairPending = %q; want MATCHING", s)
+	}
+
+	// 先頭がのぞいた状態と違えば取り除かない(並んで来た通知の二重取り除きを防ぐ)
+	c.markAppSent("r1", "MATCHING")
+	if s, _ := c.peekAppPending("r1"); s != "ENROUTE" {
+		t.Fatalf("peekAppPending = %q; want ENROUTE(二重に取り除いた)", s)
+	}
+	c.markChairSent("r1", "ENROUTE")
+	if _, _, sent := pendingOf(t, c, "r1"); sent != 0 {
+		t.Fatalf("chairSent = %d; want 0(先頭と違う状態で数えた)", sent)
+	}
+
+	c.markAppSent("r1", "ENROUTE")
+	if _, ok := c.peekAppPending("r1"); ok {
+		t.Fatal("peekAppPending: 送り切った後に未送信が残っている")
+	}
+}
+
+func TestRideStateCacheChairFree(t *testing.T) {
+	c := newRideStateCache()
+	// ライドが無い椅子は空き
+	if !c.isChairFree("c1") {
+		t.Fatal("isChairFree(c1) = false; ライドが無いのに使用中")
+	}
+
+	c.putRide(Ride{ID: "r1", UserID: "u1", ChairID: chairID("c1"), CreatedAt: at(0), UpdatedAt: at(1)})
+	// 状態がまだ無いライドも使用中(元の COUNT(chair_sent_at) = 0)
+	if c.isChairFree("c1") {
+		t.Fatal("isChairFree(c1) = true; 状態の無いライドで空き")
+	}
+
+	statuses := []string{"MATCHING", "ENROUTE", "PICKUP", "CARRYING", "ARRIVED", "COMPLETED"}
+	for _, s := range statuses {
+		c.setStatus("r1", s)
+	}
+	// 6つ積んだだけでは使用中。椅子に送り済みの数で決まる
+	for i, s := range statuses {
+		if c.isChairFree("c1") {
+			t.Fatalf("isChairFree(c1) = true; 送り済み %d 件で空き", i)
+		}
+		c.markChairSent("r1", s)
+	}
+	if _, _, sent := pendingOf(t, c, "r1"); sent != 6 {
+		t.Fatalf("chairSent = %d; want 6", sent)
+	}
+	if !c.isChairFree("c1") {
+		t.Fatal("isChairFree(c1) = false; 6件送り済みなのに使用中")
+	}
+
+	// 次のライドが割り当たると、その送り済みの数で決まる
+	c.putRide(Ride{ID: "r2", UserID: "u2", ChairID: chairID("c1"), CreatedAt: at(10), UpdatedAt: at(11)})
+	if c.isChairFree("c1") {
+		t.Fatal("isChairFree(c1) = true; 新しいライドが割り当たったのに空き")
+	}
+}
+
+func notifyFixture() ([]Ride, []RideStatus) {
+	sent := at(100)
+	rides := []Ride{
+		{ID: "r1", UserID: "u1", ChairID: chairID("c1"), CreatedAt: at(0), UpdatedAt: at(5)},
+		{ID: "r2", UserID: "u2", ChairID: chairID("c2"), CreatedAt: at(0), UpdatedAt: at(30)},
+	}
+	statuses := []RideStatus{
+		// r1: 走行中。app は ENROUTE から、椅子は PICKUP から未送信
+		{RideID: "r1", Status: "PICKUP", CreatedAt: at(3)},
+		{RideID: "r1", Status: "MATCHING", CreatedAt: at(0), AppSentAt: &sent, ChairSentAt: &sent},
+		{RideID: "r1", Status: "ENROUTE", CreatedAt: at(2), ChairSentAt: &sent},
+		// r2: 6つとも送り済み
+		{RideID: "r2", Status: "MATCHING", CreatedAt: at(0), AppSentAt: &sent, ChairSentAt: &sent},
+		{RideID: "r2", Status: "ENROUTE", CreatedAt: at(10), AppSentAt: &sent, ChairSentAt: &sent},
+		{RideID: "r2", Status: "PICKUP", CreatedAt: at(15), AppSentAt: &sent, ChairSentAt: &sent},
+		{RideID: "r2", Status: "CARRYING", CreatedAt: at(20), AppSentAt: &sent, ChairSentAt: &sent},
+		{RideID: "r2", Status: "ARRIVED", CreatedAt: at(25), AppSentAt: &sent, ChairSentAt: &sent},
+		{RideID: "r2", Status: "COMPLETED", CreatedAt: at(30), AppSentAt: &sent, ChairSentAt: &sent},
+	}
+	return rides, statuses
+}
+
+func TestRideStateCacheLoadUseSentAt(t *testing.T) {
+	c := newRideStateCache()
+	c.setStatus("old", "MATCHING")
+	rides, statuses := notifyFixture()
+	c.load(rides, statuses, rebuildUseSentAt)
+
+	// 作り直す前の印は残らない
+	if _, ok := c.peekAppPending("old"); ok {
+		t.Error("load 前の未送信が残っている")
+	}
+
+	// *_sent_at が NULL の状態を created_at の古い順に積み、送り済みの数は chair_sent_at の数
+	app, chair, sent := pendingOf(t, c, "r1")
+	if !equalStrings(app, []string{"ENROUTE", "PICKUP"}) || !equalStrings(chair, []string{"PICKUP"}) || sent != 2 {
+		t.Fatalf("r1 = %v, %v, %d; want [ENROUTE PICKUP], [PICKUP], 2", app, chair, sent)
+	}
+	app, chair, sent = pendingOf(t, c, "r2")
+	if len(app) != 0 || len(chair) != 0 || sent != 6 {
+		t.Fatalf("r2 = %v, %v, %d; want [], [], 6", app, chair, sent)
+	}
+	if c.isChairFree("c1") {
+		t.Error("isChairFree(c1) = true; 走行中なのに空き")
+	}
+	if !c.isChairFree("c2") {
+		t.Error("isChairFree(c2) = false; 6件送り済みなのに使用中")
+	}
+}
+
+func TestRideStateCacheLoadAllSent(t *testing.T) {
+	c := newRideStateCache()
+	rides, statuses := notifyFixture()
+	c.load(rides, statuses, rebuildAllSent)
+
+	// 再起動後は DB の *_sent_at に関わらず、すべて送り済みとして作る
+	app, chair, sent := pendingOf(t, c, "r1")
+	if len(app) != 0 || len(chair) != 0 || sent != 3 {
+		t.Fatalf("r1 = %v, %v, %d; want [], [], 3", app, chair, sent)
+	}
+	app, chair, sent = pendingOf(t, c, "r2")
+	if len(app) != 0 || len(chair) != 0 || sent != 6 {
+		t.Fatalf("r2 = %v, %v, %d; want [], [], 6", app, chair, sent)
+	}
+	// 通知は最新状態を返す
+	if _, ok := c.peekAppPending("r1"); ok {
+		t.Error("peekAppPending(r1): 送り済みのはずが未送信がある")
+	}
+	if s, _ := c.getLatestStatus("r1"); s != "PICKUP" {
+		t.Errorf("getLatestStatus(r1) = %q; want PICKUP", s)
+	}
+	// 走行中の椅子は使用中のまま、終わった椅子は空き
+	if c.isChairFree("c1") {
+		t.Error("isChairFree(c1) = true; 走行中なのに空き")
+	}
+	if !c.isChairFree("c2") {
+		t.Error("isChairFree(c2) = false; 終わったライドなのに使用中")
+	}
+
+	// 再起動後に届いた状態は未送信として積まれる
+	c.setStatus("r1", "CARRYING")
+	if s, ok := c.peekChairPending("r1"); !ok || s != "CARRYING" {
+		t.Fatalf("peekChairPending(r1) = %q, %v; want CARRYING", s, ok)
 	}
 }
