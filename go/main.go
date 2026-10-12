@@ -120,7 +120,6 @@ func setup() http.Handler {
 	db = _db
 
 	mux := chi.NewRouter()
-	mux.Use(middleware.Logger)
 	mux.Use(middleware.Recoverer)
 	mux.HandleFunc("POST /api/initialize", postInitialize)
 
@@ -242,8 +241,6 @@ func writeError(w http.ResponseWriter, statusCode int, err error) {
 		return
 	}
 	w.Write(buf)
-
-	slog.Error("error response wrote", err)
 }
 
 func secureRandomStr(b int) string {
