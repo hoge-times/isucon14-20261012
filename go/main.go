@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	crand "crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -21,6 +23,18 @@ var db *sqlx.DB
 
 func main() {
 	mux := setup()
+
+	// DB は別の台にあり、再起動直後はまだ起きていないことがある。
+	// 空の map のまま応答を始めないよう、DB からライドの状態を作れるまで listen しない
+	for {
+		err := rideStates.rebuild(context.Background(), db)
+		if err == nil {
+			break
+		}
+		slog.Warn("failed to load ride states, retrying", "error", err)
+		time.Sleep(3 * time.Second)
+	}
+
 	slog.Info("Listening on :8080")
 	http.ListenAndServe(":8080", mux)
 }
@@ -60,7 +74,8 @@ func setup() http.Handler {
 	dbConfig.ParseTime = true
 	dbConfig.InterpolateParams = true
 
-	_db, err := sqlx.Connect("mysql", dbConfig.FormatDSN())
+	// Connect は DB に繋がらないとエラーになり起動時に落ちるので Open にする。繋がるまでは main() で map の作り直しをやり直して待つ
+	_db, err := sqlx.Open("mysql", dbConfig.FormatDSN())
 	if err != nil {
 		panic(err)
 	}
@@ -138,6 +153,12 @@ func postInitialize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err := db.ExecContext(ctx, "UPDATE settings SET value = ? WHERE name = 'payment_gateway_url'", req.PaymentServer); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	// init.sh で入れ直したデータからライドの状態を作り直す
+	if err := rideStates.rebuild(ctx, db); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

@@ -414,6 +414,8 @@ func appPostRides(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	rideStates.putRide(ride)
+	rideStates.setStatus(rideID, "MATCHING")
 
 	writeJSON(w, http.StatusAccepted, &appPostRidesResponse{
 		RideID: rideID,
@@ -609,6 +611,9 @@ func appPostRideEvaluatation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	// ride は COMPLETED の INSERT の後に同じトランザクションで読み直した行
+	rideStates.putRide(*ride)
+	rideStates.setStatus(ride.ID, "COMPLETED")
 
 	writeJSON(w, http.StatusOK, &appPostRideEvaluationResponse{
 		CompletedAt: ride.UpdatedAt.UnixMilli(),
@@ -652,27 +657,26 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 	user := ctx.Value("user").(*User)
 
 	// 書き込みは app_sent_at の UPDATE 1本だけなので、トランザクションを張らずに db へ直接撃つ
-	ride := &Ride{}
-	if err := db.GetContext(ctx, ride, `SELECT * FROM rides WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`, user.ID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			writeJSON(w, http.StatusOK, &appGetNotificationResponse{
-				RetryAfterMs: notificationRetryAfterMs,
-			})
-			return
-		}
-		writeError(w, http.StatusInternalServerError, err)
+	// ユーザーの最新のライドと、その最新の状態はメモリから引く
+	latestRide, ok := rideStates.getUserLatestRide(user.ID)
+	if !ok {
+		writeJSON(w, http.StatusOK, &appGetNotificationResponse{
+			RetryAfterMs: notificationRetryAfterMs,
+		})
 		return
 	}
+	ride := &latestRide
 
 	yetSentRideStatus := RideStatus{}
 	status := ""
 	if err := db.GetContext(ctx, &yetSentRideStatus, `SELECT * FROM ride_statuses WHERE ride_id = ? AND app_sent_at IS NULL ORDER BY created_at ASC LIMIT 1`, ride.ID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			status, err = getLatestRideStatus(ctx, db, ride.ID)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, err)
+			latest, ok := rideStates.getLatestStatus(ride.ID)
+			if !ok {
+				writeError(w, http.StatusInternalServerError, sql.ErrNoRows)
 				return
 			}
+			status = latest
 		} else {
 			writeError(w, http.StatusInternalServerError, err)
 			return

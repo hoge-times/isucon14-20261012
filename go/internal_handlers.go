@@ -67,9 +67,22 @@ WHERE chairs.is_active = TRUE
 			break
 		}
 
-		if _, err := db.ExecContext(ctx, "UPDATE rides SET chair_id = ? WHERE id = ? AND chair_id IS NULL", chairs[best].ID, ride.ID); err != nil {
+		result, err := db.ExecContext(ctx, "UPDATE rides SET chair_id = ? WHERE id = ? AND chair_id IS NULL", chairs[best].ID, ride.ID)
+		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
+		}
+		// 割り当てられたときだけ、updated_at を DB から読み直してメモリに反映する
+		if count, err := result.RowsAffected(); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		} else if count == 1 {
+			assigned := Ride{}
+			if err := db.GetContext(ctx, &assigned, "SELECT * FROM rides WHERE id = ?", ride.ID); err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			rideStates.putRide(assigned)
 		}
 		chairs[best] = chairs[len(chairs)-1]
 		chairs = chairs[:len(chairs)-1]
