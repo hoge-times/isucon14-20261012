@@ -141,19 +141,22 @@ func (c *rideStateCache) putRideLocked(r Ride) {
 	}
 }
 
-// ride_statuses に INSERT した状態を入れる
+// ride_statuses に INSERT した状態を入れ、ユーザーの通知(SSE)に知らせる
 func (c *rideStateCache) setStatus(rideID, status string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	// 通知が消えるとベンチが落ちるので、最新状態の更新を捨てる場合でも未送信の列には足す
 	n := c.notifyLocked(rideID)
 	n.appPending = insertPending(n.appPending, status)
 	n.chairPending = insertPending(n.chairPending, status)
 
-	if cur, ok := c.latestStatus[rideID]; ok && rideStatusOrder[status] < rideStatusOrder[cur] {
-		return
+	if cur, ok := c.latestStatus[rideID]; !ok || rideStatusOrder[status] >= rideStatusOrder[cur] {
+		c.latestStatus[rideID] = status
 	}
-	c.latestStatus[rideID] = status
+	userID := c.rides[rideID].UserID
+	c.mu.Unlock()
+
+	// 未送信の列には足しているので、最新状態の更新を捨てた場合も知らせる
+	appNotifier.notify(userID)
 }
 
 func (c *rideStateCache) notifyLocked(rideID string) *rideNotifyState {
