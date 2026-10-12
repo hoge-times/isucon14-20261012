@@ -51,6 +51,20 @@ CREATE TABLE chair_locations
 )
   COMMENT = '椅子の現在位置情報テーブル';
 
+-- owner/chairs が chair_locations の全履歴を毎回集計しないよう、椅子ごとの最新座標と総移動距離を持つ。
+-- 初期データ分は 4-chair-distances.sql で作り、以降は POST /api/chair/coordinate が UPSERT する
+DROP TABLE IF EXISTS chair_distances;
+CREATE TABLE chair_distances
+(
+  chair_id                  VARCHAR(26) NOT NULL COMMENT '椅子ID',
+  latitude                  INTEGER     NOT NULL COMMENT '最新の経度',
+  longitude                 INTEGER     NOT NULL COMMENT '最新の緯度',
+  total_distance            INTEGER     NOT NULL COMMENT '総移動距離',
+  total_distance_updated_at DATETIME(6) NOT NULL COMMENT '最新の位置の登録日時',
+  PRIMARY KEY (chair_id)
+)
+  COMMENT = '椅子ごとの最新位置と総移動距離のテーブル';
+
 DROP TABLE IF EXISTS users;
 CREATE TABLE users
 (
