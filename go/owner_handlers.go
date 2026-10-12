@@ -1,7 +1,6 @@
 package main
 
 import (
-	"database/sql"
 	"errors"
 	"net/http"
 	"strconv"
@@ -163,19 +162,6 @@ func calculateSale(ride Ride) int {
 	return calculateFare(ride.PickupLatitude, ride.PickupLongitude, ride.DestinationLatitude, ride.DestinationLongitude)
 }
 
-type chairWithDetail struct {
-	ID                     string       `db:"id"`
-	OwnerID                string       `db:"owner_id"`
-	Name                   string       `db:"name"`
-	AccessToken            string       `db:"access_token"`
-	Model                  string       `db:"model"`
-	IsActive               bool         `db:"is_active"`
-	CreatedAt              time.Time    `db:"created_at"`
-	UpdatedAt              time.Time    `db:"updated_at"`
-	TotalDistance          int          `db:"total_distance"`
-	TotalDistanceUpdatedAt sql.NullTime `db:"total_distance_updated_at"`
-}
-
 type ownerGetChairResponse struct {
 	Chairs []ownerGetChairResponseChair `json:"chairs"`
 }
@@ -194,30 +180,8 @@ func ownerGetChairs(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	owner := ctx.Value("owner").(*Owner)
 
-	chairs := []chairWithDetail{}
-	if err := db.SelectContext(ctx, &chairs, `SELECT id,
-       owner_id,
-       name,
-       access_token,
-       model,
-       is_active,
-       created_at,
-       updated_at,
-       IFNULL(total_distance, 0) AS total_distance,
-       total_distance_updated_at
-FROM chairs
-       LEFT JOIN (SELECT chair_id,
-                          SUM(IFNULL(distance, 0)) AS total_distance,
-                          MAX(created_at)          AS total_distance_updated_at
-                   FROM (SELECT chair_id,
-                                created_at,
-                                ABS(latitude - LAG(latitude) OVER (PARTITION BY chair_id ORDER BY created_at)) +
-                                ABS(longitude - LAG(longitude) OVER (PARTITION BY chair_id ORDER BY created_at)) AS distance
-                         FROM chair_locations
-                         WHERE chair_id IN (SELECT id FROM chairs WHERE owner_id = ?)) tmp
-                   GROUP BY chair_id) distance_table ON distance_table.chair_id = chairs.id
-WHERE owner_id = ?
-`, owner.ID, owner.ID); err != nil {
+	chairs := []Chair{}
+	if err := db.SelectContext(ctx, &chairs, `SELECT * FROM chairs WHERE owner_id = ?`, owner.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -225,15 +189,16 @@ WHERE owner_id = ?
 	res := ownerGetChairResponse{}
 	for _, chair := range chairs {
 		c := ownerGetChairResponseChair{
-			ID:            chair.ID,
-			Name:          chair.Name,
-			Model:         chair.Model,
-			Active:        chair.IsActive,
-			RegisteredAt:  chair.CreatedAt.UnixMilli(),
-			TotalDistance: chair.TotalDistance,
+			ID:           chair.ID,
+			Name:         chair.Name,
+			Model:        chair.Model,
+			Active:       chair.IsActive,
+			RegisteredAt: chair.CreatedAt.UnixMilli(),
 		}
-		if chair.TotalDistanceUpdatedAt.Valid {
-			t := chair.TotalDistanceUpdatedAt.Time.UnixMilli()
+		// 座標が1件も無い椅子は 0 のまま、更新日時を返さない
+		if d, ok := getChairDistance(chair.ID); ok {
+			c.TotalDistance = d.TotalDistance
+			t := d.UpdatedAt.UnixMilli()
 			c.TotalDistanceUpdatedAt = &t
 		}
 		res.Chairs = append(res.Chairs, c)

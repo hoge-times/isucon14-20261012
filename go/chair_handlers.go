@@ -161,6 +161,9 @@ func chairPostCoordinate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ロールバックした座標を数えないよう、Commit の後に足す
+	addChairLocation(chair.ID, req.Latitude, req.Longitude, location.CreatedAt)
+
 	writeJSON(w, http.StatusOK, &chairPostCoordinateResponse{
 		RecordedAt: location.CreatedAt.UnixMilli(),
 	})

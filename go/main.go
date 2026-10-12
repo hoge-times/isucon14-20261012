@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	crand "crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -65,6 +66,11 @@ func setup() http.Handler {
 		panic(err)
 	}
 	db = _db
+
+	// 再起動後(initialize が来ないまま)でも owner/chairs が走行中の距離を返せるよう、起動時にも作る
+	if err := loadChairDistances(context.Background()); err != nil {
+		panic(err)
+	}
 
 	mux := chi.NewRouter()
 	mux.Use(middleware.Logger)
@@ -131,6 +137,11 @@ func postInitialize(w http.ResponseWriter, r *http.Request) {
 
 	if out, err := exec.Command("../sql/init.sh").CombinedOutput(); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to initialize: %s: %w", string(out), err))
+		return
+	}
+
+	if err := loadChairDistances(ctx); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 
