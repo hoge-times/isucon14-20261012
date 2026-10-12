@@ -127,6 +127,24 @@ func chairPostCoordinate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 前の座標との差分を総移動距離に足す。MySQL は代入を左から評価するので、total_distance を座標より先に書く。
+	// 既存の行の列は chair_distances. で修飾する(行エイリアス new と同名の列が曖昧になるため)。
+	// 更新日時は読み戻した created_at をそのまま入れ、元の集計の MAX(created_at) と揃える
+	if _, err := tx.ExecContext(
+		ctx,
+		`INSERT INTO chair_distances (chair_id, latitude, longitude, total_distance, total_distance_updated_at)
+VALUES (?, ?, ?, 0, ?) AS new
+ON DUPLICATE KEY UPDATE
+  total_distance = chair_distances.total_distance + ABS(new.latitude - chair_distances.latitude) + ABS(new.longitude - chair_distances.longitude),
+  latitude = new.latitude,
+  longitude = new.longitude,
+  total_distance_updated_at = new.total_distance_updated_at`,
+		chair.ID, location.Latitude, location.Longitude, location.CreatedAt,
+	); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
 	ride := &Ride{}
 	if err := tx.GetContext(ctx, ride, `SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chair.ID); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
