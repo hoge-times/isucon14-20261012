@@ -76,3 +76,10 @@ log_error = /var/log/mysql/error.log
 max_binlog_size   = 100M
 # binlog_do_db		= include_database_name
 # binlog_ignore_db	= include_database_name
+
+# COMMIT のたびに redo log と binlog の2回 fsync していたのを減らす。
+# 2 は COMMIT ごとに OS へ書き、fsync は1秒ごと。mysqld が落ちても消えず、
+# 消えうるのは OS ごと落ちたときの直近1秒だけ(通常の再起動では残る)。
+innodb_flush_log_at_trx_commit = 2
+# レプリケーションを使っていないので binlog は書かない
+disable_log_bin
