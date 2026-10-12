@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,9 +15,9 @@ import (
 // ポーリングでは状態が変わっていなくても、毎回 認証・ライドの読み出し・運賃と椅子の成績の計算をしていた。
 // 接続を張ったままにして、ライドの状態が変わったときだけ送る。
 // 状態が変わったことは rideStates.setStatus(状態を INSERT したハンドラがコミットの後に呼ぶ)が appNotifier.notify で知らせる。
-// 購読はプロセスのメモリ上にあるので、アプリが1プロセスで動いている前提。
+// 送る状態は rideStates の未送信の列から取る。購読も列もプロセスのメモリ上にあるので、アプリが1プロセスで動いている前提。
 
-// 知らせを取りこぼしたときの保険として DB を見直す間隔。仕様の「状態が変わってから3秒以内」に収まるようにする
+// 知らせを取りこぼしたときの保険として未送信の列を見直す間隔。仕様の「状態が変わってから3秒以内」に収まるようにする
 const appNotificationFallbackInterval = 2 * time.Second
 
 // ID(ユーザーなど)ごとに、状態が変わったことを待っている接続へ知らせる
@@ -65,7 +64,7 @@ func appGetNotificationSSE(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	user := ctx.Value("user").(*User)
 
-	// DB を読む前に購読する。読んだ直後に入った状態の変化を取りこぼさないため
+	// 未送信の列を読む前に購読する。読んだ直後に入った状態の変化を取りこぼさないため
 	ch := appNotifier.subscribe(user.ID)
 	defer appNotifier.unsubscribe(user.ID, ch)
 
@@ -102,49 +101,42 @@ func appGetNotificationSSE(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// 最新のライドの未送信の状態を、古い順にすべて送る
+// 最新のライドの未送信の状態(メモリの列)を、古い順にすべて送る
 func writeAppNotifications(ctx context.Context, w http.ResponseWriter, rc *http.ResponseController, user *User, sendLatest bool) error {
-	ride := &Ride{}
-	if err := db.GetContext(ctx, ride, `SELECT * FROM rides WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`, user.ID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+	sent := false
+	for {
+		ride, ok := rideStates.getUserLatestRide(user.ID)
+		if !ok {
 			return nil
 		}
-		return err
-	}
+		status, pending := rideStates.peekAppPending(ride.ID)
+		if !pending {
+			if sent || !sendLatest {
+				return nil
+			}
+			latest, ok := rideStates.getLatestStatus(ride.ID)
+			if !ok {
+				return nil
+			}
+			status = latest
+		}
 
-	statuses := []RideStatus{}
-	if err := db.SelectContext(ctx, &statuses, `SELECT * FROM ride_statuses WHERE ride_id = ? AND app_sent_at IS NULL ORDER BY created_at ASC`, ride.ID); err != nil {
-		return err
-	}
-	if len(statuses) == 0 && !sendLatest {
-		return nil
-	}
-
-	data, err := buildAppNotificationData(ctx, user, ride)
-	if err != nil {
-		return err
-	}
-
-	if len(statuses) == 0 {
-		status, err := getLatestRideStatus(ctx, db, ride.ID)
+		// 送る直前のライドから組み立てる。途中で COMPLETED が入ったときも、評価の入った椅子の成績で送るため
+		data, err := buildAppNotificationData(ctx, user, &ride)
 		if err != nil {
 			return err
 		}
 		data.Status = status
-		return writeSSEData(w, rc, data)
-	}
-
-	for _, s := range statuses {
-		data.Status = s.Status
 		if err := writeSSEData(w, rc, data); err != nil {
 			return err
 		}
-		// 送れたものだけを送信済みにする。送る前に切れたら、次の接続で送り直す
-		if _, err := db.ExecContext(ctx, `UPDATE ride_statuses SET app_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, s.ID); err != nil {
-			return err
+		if !pending {
+			return nil
 		}
+		// 送れたものだけを送り済みにする。送る前に切れたら、次の接続で送り直す
+		rideStates.markAppSent(ride.ID, status)
+		sent = true
 	}
-	return nil
 }
 
 // 通知の中身のうち、状態以外を組み立てる。読むだけなのでトランザクションは張らない
