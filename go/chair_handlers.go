@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/oklog/ulid/v2"
 )
@@ -111,25 +112,22 @@ func chairPostCoordinate(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
+	// 登録日時はアプリで決めて INSERT に渡し、読み直しをなくす。
+	// created_at は DATETIME(6) なのでマイクロ秒に切り捨て、DB に入る値とレスポンスの値を揃える
 	chairLocationID := ulid.Make().String()
+	createdAt := time.Now().Truncate(time.Microsecond)
 	if _, err := tx.ExecContext(
 		ctx,
-		`INSERT INTO chair_locations (id, chair_id, latitude, longitude) VALUES (?, ?, ?, ?)`,
-		chairLocationID, chair.ID, req.Latitude, req.Longitude,
+		`INSERT INTO chair_locations (id, chair_id, latitude, longitude, created_at) VALUES (?, ?, ?, ?, ?)`,
+		chairLocationID, chair.ID, req.Latitude, req.Longitude, createdAt,
 	); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	location := &ChairLocation{}
-	if err := tx.GetContext(ctx, location, `SELECT * FROM chair_locations WHERE id = ?`, chairLocationID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 
 	// 前の座標との差分を総移動距離に足す。MySQL は代入を左から評価するので、total_distance を座標より先に書く。
 	// 既存の行の列は chair_distances. で修飾する(行エイリアス new と同名の列が曖昧になるため)。
-	// 更新日時は読み戻した created_at をそのまま入れ、元の集計の MAX(created_at) と揃える
+	// 更新日時は chair_locations に入れた created_at をそのまま入れ、元の集計の MAX(created_at) と揃える
 	if _, err := tx.ExecContext(
 		ctx,
 		`INSERT INTO chair_distances (chair_id, latitude, longitude, total_distance, total_distance_updated_at)
@@ -139,7 +137,7 @@ ON DUPLICATE KEY UPDATE
   latitude = new.latitude,
   longitude = new.longitude,
   total_distance_updated_at = new.total_distance_updated_at`,
-		chair.ID, location.Latitude, location.Longitude, location.CreatedAt,
+		chair.ID, req.Latitude, req.Longitude, createdAt,
 	); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -180,7 +178,7 @@ ON DUPLICATE KEY UPDATE
 	}
 
 	writeJSON(w, http.StatusOK, &chairPostCoordinateResponse{
-		RecordedAt: location.CreatedAt.UnixMilli(),
+		RecordedAt: createdAt.UnixMilli(),
 	})
 }
 
@@ -206,17 +204,12 @@ func chairGetNotification(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	chair := ctx.Value("chair").(*Chair)
 
-	tx, err := db.Beginx()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	defer tx.Rollback()
+	// 書き込みは chair_sent_at の UPDATE 1本だけなので、トランザクションを張らずに db へ直接撃つ
 	ride := &Ride{}
 	yetSentRideStatus := RideStatus{}
 	status := ""
 
-	if err := tx.GetContext(ctx, ride, `SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chair.ID); err != nil {
+	if err := db.GetContext(ctx, ride, `SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chair.ID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeJSON(w, http.StatusOK, &chairGetNotificationResponse{
 				RetryAfterMs: notificationRetryAfterMs,
@@ -227,9 +220,9 @@ func chairGetNotification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := tx.GetContext(ctx, &yetSentRideStatus, `SELECT * FROM ride_statuses WHERE ride_id = ? AND chair_sent_at IS NULL ORDER BY created_at ASC LIMIT 1`, ride.ID); err != nil {
+	if err := db.GetContext(ctx, &yetSentRideStatus, `SELECT * FROM ride_statuses WHERE ride_id = ? AND chair_sent_at IS NULL ORDER BY created_at ASC LIMIT 1`, ride.ID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			status, err = getLatestRideStatus(ctx, tx, ride.ID)
+			status, err = getLatestRideStatus(ctx, db, ride.ID)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, err)
 				return
@@ -243,23 +236,17 @@ func chairGetNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user := &User{}
-	err = tx.GetContext(ctx, user, "SELECT * FROM users WHERE id = ? FOR SHARE", ride.UserID)
-	if err != nil {
+	if err := db.GetContext(ctx, user, "SELECT * FROM users WHERE id = ?", ride.UserID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 
 	if yetSentRideStatus.ID != "" {
-		_, err := tx.ExecContext(ctx, `UPDATE ride_statuses SET chair_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSentRideStatus.ID)
+		_, err := db.ExecContext(ctx, `UPDATE ride_statuses SET chair_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSentRideStatus.ID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
 	}
 
 	writeJSON(w, http.StatusOK, &chairGetNotificationResponse{

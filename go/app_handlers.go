@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/jmoiron/sqlx"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -272,6 +271,12 @@ type appPostRidesResponse struct {
 type executableGet interface {
 	Get(dest interface{}, query string, args ...interface{}) error
 	GetContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
+}
+
+// *sqlx.DB と *sqlx.Tx のどちらでも読めるようにする。トランザクションが要らないハンドラは db をそのまま渡す
+type executableQuery interface {
+	GetContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
+	SelectContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
 }
 
 func getLatestRideStatus(ctx context.Context, tx executableGet, rideID string) (string, error) {
@@ -646,15 +651,9 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	user := ctx.Value("user").(*User)
 
-	tx, err := db.Beginx()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	defer tx.Rollback()
-
+	// 書き込みは app_sent_at の UPDATE 1本だけなので、トランザクションを張らずに db へ直接撃つ
 	ride := &Ride{}
-	if err := tx.GetContext(ctx, ride, `SELECT * FROM rides WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`, user.ID); err != nil {
+	if err := db.GetContext(ctx, ride, `SELECT * FROM rides WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`, user.ID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeJSON(w, http.StatusOK, &appGetNotificationResponse{
 				RetryAfterMs: notificationRetryAfterMs,
@@ -667,9 +666,9 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 
 	yetSentRideStatus := RideStatus{}
 	status := ""
-	if err := tx.GetContext(ctx, &yetSentRideStatus, `SELECT * FROM ride_statuses WHERE ride_id = ? AND app_sent_at IS NULL ORDER BY created_at ASC LIMIT 1`, ride.ID); err != nil {
+	if err := db.GetContext(ctx, &yetSentRideStatus, `SELECT * FROM ride_statuses WHERE ride_id = ? AND app_sent_at IS NULL ORDER BY created_at ASC LIMIT 1`, ride.ID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			status, err = getLatestRideStatus(ctx, tx, ride.ID)
+			status, err = getLatestRideStatus(ctx, db, ride.ID)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, err)
 				return
@@ -682,7 +681,7 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 		status = yetSentRideStatus.Status
 	}
 
-	fare, err := calculateDiscountedFare(ctx, tx, user.ID, ride, ride.PickupLatitude, ride.PickupLongitude, ride.DestinationLatitude, ride.DestinationLongitude)
+	fare, err := calculateDiscountedFare(ctx, db, user.ID, ride, ride.PickupLatitude, ride.PickupLongitude, ride.DestinationLatitude, ride.DestinationLongitude)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -709,12 +708,12 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 
 	if ride.ChairID.Valid {
 		chair := &Chair{}
-		if err := tx.GetContext(ctx, chair, `SELECT * FROM chairs WHERE id = ?`, ride.ChairID); err != nil {
+		if err := db.GetContext(ctx, chair, `SELECT * FROM chairs WHERE id = ?`, ride.ChairID); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 
-		stats, err := getChairStats(ctx, tx, chair.ID)
+		stats, err := getChairStats(ctx, db, chair.ID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -729,75 +728,39 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if yetSentRideStatus.ID != "" {
-		_, err := tx.ExecContext(ctx, `UPDATE ride_statuses SET app_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSentRideStatus.ID)
+		_, err := db.ExecContext(ctx, `UPDATE ride_statuses SET app_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSentRideStatus.ID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
 	writeJSON(w, http.StatusOK, response)
 }
 
-func getChairStats(ctx context.Context, tx *sqlx.Tx, chairID string) (appGetNotificationResponseChairStats, error) {
+func getChairStats(ctx context.Context, tx executableQuery, chairID string) (appGetNotificationResponseChairStats, error) {
 	stats := appGetNotificationResponseChairStats{}
 
-	rides := []Ride{}
-	err := tx.SelectContext(
+	// 完了したライド(evaluation が入っている)の件数と評価の合計を1クエリで出す。
+	// 初期データには CARRYING を経ずに完了したライドがあり、元の実装はそれを数えないので EXISTS で揃える。
+	// 平均は MySQL の AVG(小数4桁に丸まる)を使わず、元と同じく Go で割る
+	row := struct {
+		TotalRidesCount int `db:"total_rides_count"`
+		TotalEvaluation int `db:"total_evaluation"`
+	}{}
+	if err := tx.GetContext(
 		ctx,
-		&rides,
-		`SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC`,
+		&row,
+		`SELECT COUNT(*) AS total_rides_count, IFNULL(SUM(r.evaluation), 0) AS total_evaluation FROM rides r
+WHERE r.chair_id = ? AND r.evaluation IS NOT NULL
+  AND EXISTS (SELECT 1 FROM ride_statuses rs WHERE rs.ride_id = r.id AND rs.status = 'CARRYING')`,
 		chairID,
-	)
-	if err != nil {
+	); err != nil {
 		return stats, err
 	}
-
-	totalRideCount := 0
-	totalEvaluation := 0.0
-	for _, ride := range rides {
-		rideStatuses := []RideStatus{}
-		err = tx.SelectContext(
-			ctx,
-			&rideStatuses,
-			`SELECT * FROM ride_statuses WHERE ride_id = ? ORDER BY created_at`,
-			ride.ID,
-		)
-		if err != nil {
-			return stats, err
-		}
-
-		var arrivedAt, pickupedAt *time.Time
-		var isCompleted bool
-		for _, status := range rideStatuses {
-			if status.Status == "ARRIVED" {
-				arrivedAt = &status.CreatedAt
-			} else if status.Status == "CARRYING" {
-				pickupedAt = &status.CreatedAt
-			}
-			if status.Status == "COMPLETED" {
-				isCompleted = true
-			}
-		}
-		if arrivedAt == nil || pickupedAt == nil {
-			continue
-		}
-		if !isCompleted {
-			continue
-		}
-
-		totalRideCount++
-		totalEvaluation += float64(*ride.Evaluation)
-	}
-
-	stats.TotalRidesCount = totalRideCount
-	if totalRideCount > 0 {
-		stats.TotalEvaluationAvg = totalEvaluation / float64(totalRideCount)
+	stats.TotalRidesCount = row.TotalRidesCount
+	if row.TotalRidesCount > 0 {
+		stats.TotalEvaluationAvg = float64(row.TotalEvaluation) / float64(row.TotalRidesCount)
 	}
 
 	return stats, nil
@@ -939,7 +902,7 @@ func calculateFare(pickupLatitude, pickupLongitude, destLatitude, destLongitude 
 	return initialFare + meteredFare
 }
 
-func calculateDiscountedFare(ctx context.Context, tx *sqlx.Tx, userID string, ride *Ride, pickupLatitude, pickupLongitude, destLatitude, destLongitude int) (int, error) {
+func calculateDiscountedFare(ctx context.Context, tx executableQuery, userID string, ride *Ride, pickupLatitude, pickupLongitude, destLatitude, destLongitude int) (int, error) {
 	var coupon Coupon
 	discount := 0
 	if ride != nil {
