@@ -143,16 +143,13 @@ ON DUPLICATE KEY UPDATE
 		return
 	}
 
-	ride := &Ride{}
-	if err := tx.GetContext(ctx, ride, `SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chair.ID); err != nil {
-		if !errors.Is(err, sql.ErrNoRows) {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-	} else {
-		status, err := getLatestRideStatus(ctx, tx, ride.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+	// 椅子のいまのライドと、その最新の状態はメモリから引く
+	rideID := ""
+	insertedStatus := ""
+	if ride, ok := rideStates.getChairRide(chair.ID); ok {
+		status, ok := rideStates.getLatestStatus(ride.ID)
+		if !ok {
+			writeError(w, http.StatusInternalServerError, sql.ErrNoRows)
 			return
 		}
 		if status != "COMPLETED" && status != "CANCELED" {
@@ -161,6 +158,7 @@ ON DUPLICATE KEY UPDATE
 					writeError(w, http.StatusInternalServerError, err)
 					return
 				}
+				rideID, insertedStatus = ride.ID, "PICKUP"
 			}
 
 			if req.Latitude == ride.DestinationLatitude && req.Longitude == ride.DestinationLongitude && status == "CARRYING" {
@@ -168,6 +166,7 @@ ON DUPLICATE KEY UPDATE
 					writeError(w, http.StatusInternalServerError, err)
 					return
 				}
+				rideID, insertedStatus = ride.ID, "ARRIVED"
 			}
 		}
 	}
@@ -175,6 +174,9 @@ ON DUPLICATE KEY UPDATE
 	if err := tx.Commit(); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if insertedStatus != "" {
+		rideStates.setStatus(rideID, insertedStatus)
 	}
 
 	writeJSON(w, http.StatusOK, &chairPostCoordinateResponse{
@@ -205,28 +207,26 @@ func chairGetNotification(w http.ResponseWriter, r *http.Request) {
 	chair := ctx.Value("chair").(*Chair)
 
 	// 書き込みは chair_sent_at の UPDATE 1本だけなので、トランザクションを張らずに db へ直接撃つ
-	ride := &Ride{}
 	yetSentRideStatus := RideStatus{}
 	status := ""
 
-	if err := db.GetContext(ctx, ride, `SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chair.ID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			writeJSON(w, http.StatusOK, &chairGetNotificationResponse{
-				RetryAfterMs: notificationRetryAfterMs,
-			})
-			return
-		}
-		writeError(w, http.StatusInternalServerError, err)
+	// 椅子のいまのライドと、その最新の状態はメモリから引く
+	ride, ok := rideStates.getChairRide(chair.ID)
+	if !ok {
+		writeJSON(w, http.StatusOK, &chairGetNotificationResponse{
+			RetryAfterMs: notificationRetryAfterMs,
+		})
 		return
 	}
 
 	if err := db.GetContext(ctx, &yetSentRideStatus, `SELECT * FROM ride_statuses WHERE ride_id = ? AND chair_sent_at IS NULL ORDER BY created_at ASC LIMIT 1`, ride.ID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			status, err = getLatestRideStatus(ctx, db, ride.ID)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, err)
+			latest, ok := rideStates.getLatestStatus(ride.ID)
+			if !ok {
+				writeError(w, http.StatusInternalServerError, sql.ErrNoRows)
 				return
 			}
+			status = latest
 		} else {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -308,6 +308,7 @@ func chairPostRideStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	insertedStatus := ""
 	switch req.Status {
 	// Acknowledge the ride
 	case "ENROUTE":
@@ -315,6 +316,7 @@ func chairPostRideStatus(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		insertedStatus = "ENROUTE"
 	// After Picking up user
 	case "CARRYING":
 		status, err := getLatestRideStatus(ctx, tx, ride.ID)
@@ -330,6 +332,7 @@ func chairPostRideStatus(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		insertedStatus = "CARRYING"
 	default:
 		writeError(w, http.StatusBadRequest, errors.New("invalid status"))
 	}
@@ -337,6 +340,9 @@ func chairPostRideStatus(w http.ResponseWriter, r *http.Request) {
 	if err := tx.Commit(); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if insertedStatus != "" {
+		rideStates.setStatus(ride.ID, insertedStatus)
 	}
 
 	w.WriteHeader(http.StatusNoContent)
